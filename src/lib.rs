@@ -26,7 +26,8 @@
 //! 1. **Attach [`GuardFairing`]** (`Kind::Ignite | Kind::Request |
 //!    Kind::Response`). Its `on_request` scans the path, query, and header
 //!    views and stashes the verdict in request-local state. Its `on_ignite`
-//!    registers the `403`/`413`/`500` catchers that render refusals as the
+//!    registers the `400`/`403`/`413`/`429`/`500` catchers that render
+//!    refusals as the
 //!    ecosystem's plain-text error shape (skipping any status the application
 //!    already registered a catcher for, because Rocket treats same-code
 //!    catchers at the same base as a fatal collision).
@@ -58,9 +59,9 @@
 //! ```
 //!
 //! Routes without either guard argument are scanned but not blocked; the
-//! fairing additionally rewrites a `404` to the guarded `403` when the
-//! verdict is a threat, so a threat to a path that matches no route does not
-//! leak a `404`. A `404` is proof that no handler ran, which is why that
+//! fairing additionally rewrites a `404` to the verdict's guarded refusal
+//! shape when the verdict is a block, so a threat to a path that matches no
+//! route does not leak a `404`. A `404` is proof that no handler ran, which is why that
 //! rewrite is safe; a route that *did* run cannot be un-run, so the guard
 //! argument is the only real enforcement point.
 //!
@@ -102,9 +103,23 @@
 //! | Situation | Status | Body |
 //! |---|---|---|
 //! | The IP gate denies the client IP (blacklisted, or a non-empty whitelist matches neither the IP nor an exemption) | `403 Forbidden` | `Forbidden` |
-//! | Engine flags a view | `403 Forbidden` | `Suspicious activity detected` |
+//! | The ban stage finds a live ban on the client IP | `403 Forbidden` | `IP address banned` |
+//! | The rate limiter records a crossing of `rate_limit` | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
+//! | Engine flags a view | `400 Bad Request` | `Suspicious activity detected` |
+//! | Engine flags a view and the crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
 //! | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
 //! | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
+//!
+//! The IP gate is optional (`GuardFairing::with_ip_gate`); when it is
+//! configured, `exempt_ips` (like a whitelist match) only sets the skip state
+//! on the request, never a deny path of its own - the exempt-vs-whitelist
+//! contract in the engine's `ip_gate` module. The stateful stages honor that
+//! contract: the rate limiter (`GuardFairing::with_rate_limiting`) and the
+//! ban/auto-ban stage (`GuardFairing::with_ip_banning`) skip whitelisted and
+//! exempt IPs for exactly what the reference skips (rate limiting, violation
+//! counting, banning) and never skip detection, which always scans every
+//! request, exempt or not. A user-agent filter and cloud-provider blocking
+//! do not exist yet.
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family)
@@ -125,12 +140,54 @@ mod scan;
 pub use crate::fairing::GuardFairing;
 pub use crate::guards::{BlockGuard, GuardBody, GuardBodyError};
 pub use crate::response::{
-    BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE, OVERSIZE_MESSAGE, guard_catchers,
+    ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
+    OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, guard_catchers,
 };
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
+pub use guard_core_engine::ip_ban::{
+    BanError, BanRecord, Clock, IpBanConfig, IpBanConfigError, IpBanManager, ResolvedBan,
+    ThreatBanEntry, ViolationCounters,
+};
 pub use guard_core_engine::ip_gate::{
     IpGateConfig, IpGateDecision, IpGateDenial, IpGateError, IpGateVerdict,
 };
+pub use guard_core_engine::rate_limit::{
+    RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimiter,
+};
+
+use std::net::IpAddr;
+
+/// The stateful stage's ban half: the shared ban store, the shared violation
+/// counters (one fairing = one store pair), and the config that gates banning
+/// and threshold resolution.
+pub(crate) struct BanState {
+    manager: IpBanManager,
+    counters: ViolationCounters,
+    config: IpBanConfig,
+}
+
+impl core::fmt::Debug for BanState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BanState")
+            .field("manager", &self.manager)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BanState {
+    /// The auto-ban engine's one-call shape: count the categories, resolve
+    /// the thresholds, ban when one crossed.
+    pub(crate) fn register_violations(
+        &self,
+        ip: IpAddr,
+        categories: &[&str],
+        reason: &str,
+    ) -> Option<ResolvedBan> {
+        self.manager
+            .register_violations(&self.counters, ip, categories, &self.config, reason)
+    }
+}
 
 /// Engine entry point stored in the fairing.
 ///

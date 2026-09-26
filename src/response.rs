@@ -2,15 +2,16 @@
 //!
 //! Rocket guards cannot respond directly: an error outcome is dispatched to
 //! the error catcher for its status. The adapter therefore registers catchers
-//! for the three statuses its guards can produce, so every refusal carries
-//! the ecosystem's error shape (the bare message, `text/plain; charset=utf-8`,
+//! for the statuses its guards can produce, so every refusal carries the
+//! ecosystem's error shape (the bare message, `text/plain; charset=utf-8`,
 //! same as the Python family).
 //!
 //! Scoping: the `403` and `500` catchers only emit the guard body when
 //! request-local state shows the refusal came from this adapter's guards
 //! ([`Enforced`](crate::scan::Enforced) or a stashed metadata verdict);
 //! otherwise they fall back to a minimal default body, because Rocket has no
-//! public way to delegate to its own default catcher. The `413` catcher is
+//! public way to delegate to its own default catcher. The same scoping
+//! applies to the `400` and `429` catchers. The `413` catcher is
 //! deliberately unscoped: "payload too large" has one meaning regardless of
 //! which limit tripped, and Rocket's own `Json` guard maps a limit violation
 //! to a `413` error outcome, which then gets the same body.
@@ -22,11 +23,21 @@ use rocket::request::Request;
 use rocket::response::Response;
 use std::io::Cursor;
 
-/// Detail message carried by the `403 Forbidden` block response.
+/// Detail message carried by the `400 Bad Request` block response.
 pub const BLOCKED_MESSAGE: &str = "Suspicious activity detected";
 
 /// Detail message carried by the IP gate's `403 Forbidden` response.
 pub const FORBIDDEN_MESSAGE: &str = "Forbidden";
+
+/// Detail message carried by the ban stage's `403 Forbidden` response.
+pub const BANNED_MESSAGE: &str = "IP address banned";
+
+/// Detail message carried by the `403 Forbidden` response when a detected
+/// threat crossed an auto-ban threshold and the ban fired on this request.
+pub const ACTIVITY_BANNED_MESSAGE: &str = "IP has been banned";
+
+/// Detail message carried by the `429 Too Many Requests` response.
+pub const RATE_LIMITED_MESSAGE: &str = "Too many requests";
 
 /// Detail message carried by the `413 Payload Too Large` response.
 pub const OVERSIZE_MESSAGE: &str = "Payload too large";
@@ -41,7 +52,9 @@ pub const FAILURE_MESSAGE: &str = "Security check failed";
 /// Rocket's own default catcher is `pub(crate)`, so there is no way to
 /// delegate to it; these keep the status (and content type) honest without
 /// trying to reproduce Rocket's templated pages.
+const DEFAULT_400: &str = "400 Bad Request";
 const DEFAULT_403: &str = "403 Forbidden";
+const DEFAULT_429: &str = "429 Too Many Requests";
 const DEFAULT_500: &str = "500 Internal Server Error";
 
 /// The catchers this adapter registers, scoped to the base they are passed
@@ -59,28 +72,44 @@ const DEFAULT_500: &str = "500 Internal Server Error";
 #[must_use]
 pub fn guard_catchers() -> Vec<Catcher> {
     vec![
+        Catcher::new(400, blocked),
         Catcher::new(403, forbidden),
         Catcher::new(413, oversize),
+        Catcher::new(429, rate_limited),
         Catcher::new(500, failure),
     ]
 }
 
-/// `403` catcher: the guard body when a guard blocked this request, a
-/// minimal default otherwise.
-fn forbidden<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
-    let metadata = metadata_verdict(request);
-    let enforced = enforced_verdict(request);
-    let guard_caused = matches!(metadata, Some(Verdict::Threat | Verdict::IpBlocked))
-        || matches!(enforced, Some(Verdict::Threat | Verdict::IpBlocked));
-    let ip_blocked = metadata == Some(Verdict::IpBlocked) || enforced == Some(Verdict::IpBlocked);
-    let message = if ip_blocked {
-        FORBIDDEN_MESSAGE
-    } else if guard_caused {
+/// The verdict a `400`/`403`/`429` catcher is rendering, if the refusal came
+/// from this adapter: the stashed metadata verdict, else a guard's enforced
+/// verdict.
+fn refusal_verdict(request: &Request<'_>) -> Option<Verdict> {
+    metadata_verdict(request)
+        .filter(|verdict| *verdict != Verdict::Clean)
+        .or_else(|| enforced_verdict(request).filter(|verdict| *verdict != Verdict::Clean))
+}
+
+/// `400` catcher: the block body when a guard detected a threat, a minimal
+/// default otherwise.
+fn blocked<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
+    let message = if refusal_verdict(request) == Some(Verdict::Threat) {
         BLOCKED_MESSAGE
     } else {
-        DEFAULT_403
+        DEFAULT_400
     };
-    finish(status, message)
+    finish(status, message, None)
+}
+
+/// `403` catcher: the gate/ban body when a guard blocked this request, a
+/// minimal default otherwise.
+fn forbidden<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
+    let message = match refusal_verdict(request) {
+        Some(Verdict::IpBlocked) => FORBIDDEN_MESSAGE,
+        Some(Verdict::Banned) => BANNED_MESSAGE,
+        Some(Verdict::ActivityBanned) => ACTIVITY_BANNED_MESSAGE,
+        _ => DEFAULT_403,
+    };
+    finish(status, message, None)
 }
 
 /// `413` catcher: always the oversize body.
@@ -89,7 +118,18 @@ fn forbidden<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
 /// guard or framework limit produced it (Rocket's own `Json` guard maps
 /// limit violations to `413`).
 fn oversize<'r>(status: Status, _request: &'r Request<'_>) -> BoxFuture<'r> {
-    finish(status, OVERSIZE_MESSAGE)
+    finish(status, OVERSIZE_MESSAGE, None)
+}
+
+/// `429` catcher: the throttled body with its `Retry-After` header when the
+/// rate limiter blocked this request, a minimal default otherwise.
+fn rate_limited<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
+    match refusal_verdict(request) {
+        Some(Verdict::RateLimited(retry_after)) => {
+            finish(status, RATE_LIMITED_MESSAGE, Some(retry_after))
+        }
+        _ => finish(status, DEFAULT_429, None),
+    }
 }
 
 /// `500` catcher: the fail-secure body when a guard failed this request, a
@@ -104,30 +144,44 @@ fn failure<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
         } else {
             DEFAULT_500
         },
+        None,
     )
 }
 
-/// The catcher response: the bare message, `text/plain; charset=utf-8`.
-fn finish<'r>(status: Status, message: &'static str) -> BoxFuture<'r> {
+/// The catcher response: the bare message, `text/plain; charset=utf-8`, and
+/// an optional `Retry-After` header for the throttled shape.
+fn finish<'r>(status: Status, message: &'static str, retry_after: Option<u64>) -> BoxFuture<'r> {
     Box::pin(async move {
-        Ok(Response::build()
-            .status(status)
-            .header(ContentType::Plain)
+        let mut build = Response::build();
+        build.status(status).header(ContentType::Plain);
+        if let Some(after) = retry_after {
+            build.raw_header("Retry-After", after.to_string());
+        }
+        build
             .sized_body(message.len(), Cursor::new(message.as_bytes().to_vec()))
-            .finalize())
+            .ok()
     })
 }
 
-/// A standalone `403` response with the blocked body, used by
-/// [`crate::GuardFairing`] when rewriting unrouted threat responses.
-pub(crate) fn blocked_response() -> Response<'static> {
-    plain_response(Status::Forbidden, BLOCKED_MESSAGE)
-}
-
-/// A standalone `403` response with the forbidden body, used by
-/// [`crate::GuardFairing`] when rewriting unrouted IP-gate denials.
-pub(crate) fn forbidden_response() -> Response<'static> {
-    plain_response(Status::Forbidden, FORBIDDEN_MESSAGE)
+/// The standalone response for an unrouted request the fairing blocked: the
+/// `404` rewrite in [`crate::GuardFairing`] replaces Rocket's not-found page
+/// with the verdict's family shape, so probe traffic never reveals route
+/// inventory.
+pub(crate) fn verdict_response(verdict: Verdict) -> Response<'static> {
+    match verdict {
+        Verdict::Threat => plain_response(Status::BadRequest, BLOCKED_MESSAGE),
+        Verdict::IpBlocked => plain_response(Status::Forbidden, FORBIDDEN_MESSAGE),
+        Verdict::Banned => plain_response(Status::Forbidden, BANNED_MESSAGE),
+        Verdict::ActivityBanned => plain_response(Status::Forbidden, ACTIVITY_BANNED_MESSAGE),
+        Verdict::RateLimited(retry_after) => {
+            let mut response = plain_response(Status::TooManyRequests, RATE_LIMITED_MESSAGE);
+            response.set_raw_header("Retry-After", retry_after.to_string());
+            response
+        }
+        Verdict::Clean | Verdict::Failed => {
+            plain_response(Status::InternalServerError, FAILURE_MESSAGE)
+        }
+    }
 }
 
 /// The ecosystem's error shape: the bare message, `text/plain; charset=utf-8`.
@@ -137,4 +191,24 @@ fn plain_response(status: Status, message: &'static str) -> Response<'static> {
         .header(ContentType::Plain)
         .sized_body(message.len(), Cursor::new(message.as_bytes().to_vec()))
         .finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_response_covers_every_block_shape() {
+        let response = verdict_response(Verdict::Threat);
+        assert_eq!(response.status(), Status::BadRequest);
+        let response = verdict_response(Verdict::IpBlocked);
+        assert_eq!(response.status(), Status::Forbidden);
+        let response = verdict_response(Verdict::Banned);
+        assert_eq!(response.status(), Status::Forbidden);
+        let response = verdict_response(Verdict::ActivityBanned);
+        assert_eq!(response.status(), Status::Forbidden);
+        let response = verdict_response(Verdict::RateLimited(60));
+        assert_eq!(response.status(), Status::TooManyRequests);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("60"));
+    }
 }

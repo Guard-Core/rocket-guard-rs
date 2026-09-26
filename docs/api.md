@@ -15,10 +15,11 @@ rocket::build().attach(rocket_guard_rs::GuardFairing::new(config))
 ```
 
 Attach with `Kind::Ignite | Kind::Request | Kind::Response` (the default
-`Kind` set the fairing declares): `on_ignite` registers the `403`/`413`/`500`
-catchers, `on_request` scans the path, query, and header views and stashes
-the verdict in request-local state, and `on_response` supports the `404` to
-`403` rewrite described below.
+`Kind` set the fairing declares): `on_ignite` registers the
+`400`/`403`/`413`/`429`/`500` catchers, `on_request` runs the IP gate, the
+stateful stage (dynamic bans, then rate limiting), and the path, query, and
+header views, stashing the verdict in request-local state, and
+`on_response` supports the `404` rewrite described below.
 
 Constructors and builders:
 
@@ -28,11 +29,14 @@ Constructors and builders:
 | `GuardFairing::with_defaults()` | Build the fairing with `default_config()` |
 | `.with_body_cap(body_cap: usize)` | Replace the body buffering cap, in bytes. A body larger than the cap is refused with `413` rather than forwarded unscanned |
 | `.with_ip_gate(ip_gate: IpGateConfig)` | Install the global IP gate (see below) |
+| `.with_rate_limiting(limiter: RateLimiter)` | Install the rate limiter (see below) |
+| `.with_ip_banning(manager: IpBanManager, config: IpBanConfig)` | Install the dynamic ban store and the auto-ban engine (see below) |
 
 Routes without a guard argument are only scanned, not blocked: in Rocket,
 protection is per-route, and that is what the guard argument is for. When the
-verdict is a threat (or an IP-gate denial) and the request would otherwise
-answer `404`, the fairing rewrites the `404` to the guarded `403` so probe
+verdict is a block (a threat, an IP-gate denial, a live ban, an auto-ban
+firing, or a rate-limit crossing) and the request would otherwise answer
+`404`, the fairing rewrites the `404` to that verdict's family shape so probe
 traffic never reveals route inventory.
 
 ### The IP gate: `IpGateConfig`
@@ -65,19 +69,77 @@ known-friendly automation (monitoring probes, VPN egress, a partner's
 server), not immunity: it sets the same skip state a whitelist match sets but
 never adds a deny path and never opens the whitelist gate. The blacklist,
 bans-style checks, and detection still apply to exempt IPs - an attack
-payload from an exempt IP is still `403 Suspicious activity detected`. The
-Rust family ships no rate limiter, user-agent filter, cloud-provider blocker,
-or violation counter yet; a stage that lands later must skip exactly what the
-reference skips for a whitelist match (`is_whitelisted || is_exempt`) and
-never skip detection.
+payload from an exempt IP is still `400 Suspicious activity detected`. The
+stateful stages (`GuardFairing::with_rate_limiting`,
+`GuardFairing::with_ip_banning`) skip exactly what the reference skips for a
+whitelist match (`is_whitelisted || is_exempt`): rate limiting, violation
+counting, and banning. Detection never skips anything.
+
+### The rate limiter: `RateLimiter`
+
+```rust
+use rocket_guard_rs::{GuardFairing, RateLimitConfig, RateLimiter};
+
+let limiter = RateLimiter::new(RateLimitConfig {
+    enable_rate_limiting: true,
+    rate_limit: 30,
+    rate_limit_window: 10,
+    ..RateLimitConfig::default()
+})
+.expect("valid config");
+let fairing = GuardFairing::with_defaults().with_rate_limiting(limiter);
+```
+
+The limiter's constructor fails closed on a zero limit or window. Installed
+with `GuardFairing::with_rate_limiting`, it runs in `on_request` after the IP
+gate and the ban stage, before the metadata scan: a crossing is refused with
+`429 Too Many Requests` carrying `Retry-After: <window seconds>`. With
+`enable_rate_limit_auto_ban` on and IP banning configured, every crossing
+counts one `rate_limit` violation toward the auto-ban engine; the response
+stays `429` and the ban bites on the next request. Requests without a client
+IP cannot be attributed and are not rate limited; detection still screens
+them. The limiter is shared with the managed engine state and clone-shares
+its window store, so out-of-band handles (stats, admin resets) work
+alongside the installed fairing.
+
+### The ban stage: `IpBanManager` + `IpBanConfig`
+
+```rust
+use rocket_guard_rs::{GuardFairing, IpBanConfig, IpBanManager, ThreatBanEntry};
+
+let manager = IpBanManager::new();
+let config = IpBanConfig::new(
+    true,
+    10,
+    3600,
+    [("sqli", ThreatBanEntry { threshold: 3, duration: 1800 })],
+)
+.expect("valid config");
+let fairing = GuardFairing::with_defaults().with_ip_banning(manager, config);
+```
+
+The config constructor fails closed on an invalid `threat_ban_config` entry.
+Installed with `GuardFairing::with_ip_banning`, the ban check runs in
+`on_request` before the limiter: a live ban is refused with `403 Forbidden`
+(`IP address banned`) and banned traffic never consumes rate budget. Every
+detected threat counts its categories per client IP (the reference
+pipeline's suspicious-activity stage), and a crossed `threat_ban_config`
+entry or the flat `auto_ban_threshold` bans on the spot, answering
+`403 Forbidden` (`IP has been banned`); without a crossing the block keeps
+the `400 Bad Request` (`Suspicious activity detected`) shape.
+`config.enable_ip_banning = false` counts violations but never bans.
+Whitelisted and exempt IPs are never counted, so they can never be
+auto-banned. The store pair is shared with the managed engine state and
+clone-shares its stores.
 
 ### Catchers
 
-`guard_catchers() -> Vec<Catcher>` returns the `403`/`413`/`500` catchers
-that render refusals as the ecosystem's plain-text error shape. The fairing
-registers them itself, skipping any status the application already registered
-a catcher for (Rocket treats same-code catchers at the same base as a fatal
-collision).
+`guard_catchers() -> Vec<Catcher>` returns the
+`400`/`403`/`413`/`429`/`500` catchers that render refusals as the
+ecosystem's plain-text error shape (the throttled shape carries the
+`Retry-After` header). The fairing registers them itself, skipping any
+status the application already registered a catcher for (Rocket treats
+same-code catchers at the same base as a fatal collision).
 
 ## Guards
 
@@ -95,10 +157,11 @@ fn health(_guard: BlockGuard) -> &'static str {
 }
 ```
 
-It enforces the verdict stashed by the fairing: a threat answers `403`, a
-failed check answers `500`. Fail-secure rule: if the guard cannot find a
-verdict, the security system is not running, and the request is refused
-rather than passed uninspected.
+It enforces the verdict stashed by the fairing: a threat answers `400`, a
+gate denial, live ban, or auto-ban answers `403`, a rate-limit crossing
+answers `429` (with `Retry-After`), and a failed check answers `500`.
+Fail-secure rule: if the guard cannot find a verdict, the security system is
+not running, and the request is refused rather than passed uninspected.
 
 ### `GuardBody`
 
@@ -179,7 +242,10 @@ The HTTP method is not scanned.
 | Situation | Status | Body |
 |---|---|---|
 | The IP gate denies the client IP | `403 Forbidden` | `Forbidden` |
-| Engine flags a view | `403 Forbidden` | `Suspicious activity detected` |
+| A live ban on the client IP | `403 Forbidden` | `IP address banned` |
+| Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
+| Engine flags a view | `400 Bad Request` | `Suspicious activity detected` |
+| Engine flags a view and a crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
 | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
 | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
 
@@ -196,6 +262,9 @@ Re-exported refusal message bodies:
 |---|---|
 | `BLOCKED_MESSAGE` | `"Suspicious activity detected"` |
 | `FORBIDDEN_MESSAGE` | `"Forbidden"` |
+| `BANNED_MESSAGE` | `"IP address banned"` |
+| `ACTIVITY_BANNED_MESSAGE` | `"IP has been banned"` |
+| `RATE_LIMITED_MESSAGE` | `"Too many requests"` |
 | `OVERSIZE_MESSAGE` | `"Payload too large"` |
 | `FAILURE_MESSAGE` | `"Security check failed"` |
 
@@ -205,5 +274,13 @@ Re-exported refusal message bodies:
 `guard_core_engine::detect`.
 
 `IpGateConfig`, `IpGateDecision`, `IpGateDenial`, `IpGateError`, and
-`IpGateVerdict` are re-exported from `guard_core_engine::ip_gate`. A `DetectVerdict` carries `is_threat`, a
-`threat_score`, and the list of `Threat` findings (regex or semantic).
+`IpGateVerdict` are re-exported from `guard_core_engine::ip_gate`. A
+`DetectVerdict` carries `is_threat`, a `threat_score`, and the list of
+`Threat` findings (regex or semantic).
+
+`RateLimiter`, `RateLimitConfig`, `RateLimitConfigError`, and
+`RateLimitDecision` are re-exported from `guard_core_engine::rate_limit`.
+
+`IpBanManager`, `IpBanConfig`, `IpBanConfigError`, `BanError`, `BanRecord`,
+`Clock`, `ResolvedBan`, `ThreatBanEntry`, and `ViolationCounters` are
+re-exported from `guard_core_engine::ip_ban`.

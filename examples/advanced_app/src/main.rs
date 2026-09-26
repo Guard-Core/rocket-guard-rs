@@ -10,7 +10,7 @@
 //!   (no guard argument), and `/open` is scanned but deliberately not
 //!   blocked, demonstrating that in Rocket protection is per-route opt-in.
 //! - A threat to a path that matches no route is answered with the guarded
-//!   `403` (the fairing rewrites the `404`), so probe traffic never leaks
+//!   `400` (the fairing rewrites the `404`), so probe traffic never leaks
 //!   route inventory.
 //!
 //! Note on route-scoped guard configuration: Rocket fairings are global, and

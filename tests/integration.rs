@@ -77,7 +77,7 @@ async fn xss_payload_in_body_is_blocked() {
         .body("<script>alert(1)</script>")
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(response.status(), Status::BadRequest);
     assert_eq!(
         response.headers().get_one("Content-Type"),
         Some("text/plain; charset=utf-8"),
@@ -89,7 +89,7 @@ async fn xss_payload_in_body_is_blocked() {
 async fn traversal_payload_in_path_is_blocked() {
     let client = guarded_client().await;
     let response = client.get("/files/../../etc/passwd").dispatch().await;
-    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(response.status(), Status::BadRequest);
     assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
 }
 
@@ -99,7 +99,7 @@ async fn command_injection_in_query_is_blocked() {
     // and the engine's preprocessor decodes it back to `$(echo id)`.
     let client = guarded_client().await;
     let response = client.get("/search?cmd=$(echo%20id)").dispatch().await;
-    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(response.status(), Status::BadRequest);
     assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
 }
 
@@ -111,7 +111,7 @@ async fn xss_payload_in_scanned_header_is_blocked() {
         .header(Header::new("x-comment", "<script>alert(1)</script>"))
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(response.status(), Status::BadRequest);
 }
 
 #[tokio::test]
@@ -154,14 +154,14 @@ async fn body_at_the_cap_is_forwarded_intact() {
 }
 
 #[tokio::test]
-async fn unrouted_threat_path_gets_the_guarded_403_not_a_404() {
+async fn unrouted_threat_path_gets_the_guarded_400_not_a_404() {
     // No route matches `/private/...`; a plain 404 would leak that, so the
-    // fairing's on_response rewrite answers the guarded 403 instead.
+    // fairing's on_response rewrite answers the guarded 400 instead.
     let client = Client::tracked(minimal_app(GuardFairing::new(default_config())))
         .await
         .expect("valid rocket");
     let response = client.get("/private/../../etc/passwd").dispatch().await;
-    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(response.status(), Status::BadRequest);
     assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
 }
 
@@ -192,23 +192,23 @@ async fn user_catcher_takes_precedence_and_launch_stays_collision_free() {
     // The fairing must skip registering over an application catcher (Rocket
     // treats same-code catchers at the same base as a fatal collision), and
     // the application's catcher then renders guard refusals.
-    #[catch(403)]
-    fn my_forbidden() -> &'static str {
-        "custom forbidden"
+    #[catch(400)]
+    fn my_bad_request() -> &'static str {
+        "custom bad request"
     }
 
     let client = Client::tracked(
         rocket::build()
             .attach(GuardFairing::new(default_config()))
-            .register("/", catchers![my_forbidden])
+            .register("/", catchers![my_bad_request])
             .mount("/", routes![index, catch_all, echo]),
     )
     .await
     .expect("valid rocket: catcher collisions are avoided by skipping");
 
     let response = client.get("/files/../../etc/passwd").dispatch().await;
-    assert_eq!(response.status(), Status::Forbidden);
-    assert_eq!(body_text(response).await, "custom forbidden");
+    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(body_text(response).await, "custom bad request");
 }
 
 #[tokio::test]
@@ -238,7 +238,7 @@ async fn concurrent_requests_are_screened_independently() {
         if index % 2 == 0 {
             assert_eq!(status, Status::Ok, "benign request {index}");
         } else {
-            assert_eq!(status, Status::Forbidden, "threat request {index}");
+            assert_eq!(status, Status::BadRequest, "threat request {index}");
         }
     }
 }

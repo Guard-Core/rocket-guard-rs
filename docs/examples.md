@@ -19,8 +19,8 @@ A minimal guarded Rocket application
 |---|---|---|
 | `GET /health` | none (excluded) | `200 ok`; scanned by the fairing but never blocked |
 | `GET /` | `BlockGuard` | `200` greeting |
-| `GET /search?q=...` | `BlockGuard` | `200 search ok`, or `403` when the query trips the engine |
-| `POST /echo` | `GuardBody` | echoes the body; `403` for a threat, `413` over the body cap |
+| `GET /search?q=...` | `BlockGuard` | `200 search ok`, or `400` when the query trips the engine |
+| `POST /echo` | `GuardBody` | echoes the body; `400` for a threat, `413` over the body cap |
 
 The `/health` route carries no guard argument, which is the Rocket-shaped
 excluded path: the fairing still scans it (request fairings see every
@@ -40,7 +40,7 @@ that demonstrates environment-driven engine configuration and the per-route
 enforcement split: guarded routes (`BlockGuard` / `GuardBody`) refuse
 threats, `/health` is excluded (no guard argument), and `/open` is scanned
 but deliberately not blocked. A threat to a path that matches no route is
-answered with the guarded `403` (the fairing rewrites the `404`), so probe
+answered with the guarded `400` (the fairing rewrites the `404`), so probe
 traffic never reveals route inventory.
 
 Note that route-scoped guard configuration is not expressible in this
@@ -66,11 +66,11 @@ request. See the tower/axum/actix advanced examples for that demo.
 |---|---|---|
 | `GET /health` | excluded | `200 ok` |
 | `GET /` | general | `200`, greeting text |
-| `GET /search?q=...` | general | `200`, or `403` on a threat |
-| `POST /echo` | general | echoes the body; `403`/`413` from the guard |
+| `GET /search?q=...` | general | `200`, or `400` on a threat |
+| `POST /echo` | general | echoes the body; `400`/`413` from the guard |
 | `GET /admin/stats` | guarded | `200 stats` |
 | `GET /open` | none (scanned, not blocked) | `200`, even for flagged requests |
-| anything else | fairing rewrite | threat to an unmatched path answers the guarded `403` |
+| anything else | fairing rewrite | a block on an unmatched path answers the guarded refusal shape |
 
 Run it directly or with the provided Docker setup:
 

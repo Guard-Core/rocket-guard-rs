@@ -39,7 +39,7 @@ Roadmap, not reality:
 
 1. Depend on `guard-core-rs` (facade re-exporting `compiler`, `preprocessor`, `semantic`) and `rocket`.
 2. Implement Rocket's `Fairing` trait with an `on_request` callback that inspects incoming requests before routing/handlers run; a Fairing is the idiomatic Rocket extension point for cross-cutting request checks.
-3. Per request: extract method, path, headers, client IP, and body; call the engine synchronously (it is CPU-bound, no I/O, no tokio, safe to call inside Rocket's async context); deny with a 403 response on a threat verdict.
+3. Per request: extract method, path, headers, client IP, and body; call the engine synchronously (it is CPU-bound, no I/O, no tokio, safe to call inside Rocket's async context); deny with the family shape on a block verdict (`400` detection block, `403` gate/ban, `429` throttled with `Retry-After`).
 4. Rate limiting, Redis, IP intelligence, and event dispatch are out of scope: they are later sections of the reference spec and not in the engine at 0.0.1.
 5. Configuration waits for a config surface in guard-core-rs (reference spec section 02, not yet ported).
 

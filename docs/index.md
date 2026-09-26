@@ -40,14 +40,14 @@ Rocket requires:
 1. **Attach `GuardFairing`** (`Kind::Ignite | Kind::Request |
    Kind::Response`). Its `on_request` scans the path, query, and header views
    and stashes the verdict in request-local state. Its `on_ignite` registers
-   the `403`/`413`/`500` catchers that render refusals as the ecosystem's
+   the `400`/`403`/`413`/`429`/`500` catchers that render refusals as the ecosystem's
    plain-text error shape.
 2. **Add a guard argument to each protected route**: `BlockGuard` for routes
    without a body, `GuardBody` for routes with one. Protection is per-route,
    and the guard argument is Rocket's own mechanism for it.
 
 Routes without either guard argument are scanned but not blocked. The
-fairing additionally rewrites a `404` to the guarded `403` when the verdict
+fairing additionally rewrites a `404` to the guarded refusal shape when the verdict
 is a threat, so a threat to a path that matches no route does not leak a
 `404`.
 
@@ -103,7 +103,11 @@ The HTTP method is not scanned.
 
 | Situation | Status | Body |
 |---|---|---|
-| Engine flags a view | `403 Forbidden` | `Suspicious activity detected` |
+| The IP gate denies the client IP | `403 Forbidden` | `Forbidden` |
+| A live ban on the client IP | `403 Forbidden` | `IP address banned` |
+| Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
+| Engine flags a view | `400 Bad Request` | `Suspicious activity detected` |
+| Engine flags a view and a crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
 | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
 | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
 

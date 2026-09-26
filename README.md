@@ -20,7 +20,7 @@ Per the ecosystem boundary rules, this crate holds framework glue only: every de
 
 Rocket has no middleware chain that can abort a request: a fairing's `on_request` cannot short-circuit, and Rocket's own source calls request guards "the correct mechanism" for refusal. The adapter splits the work accordingly:
 
-1. **Attach the fairing.** `GuardFairing` scans the path, query, and header views of every request in `on_request` and stashes the verdict in request-local state; it also registers the `403`/`413`/`500` catchers that render refusals (skipping statuses the application already registered, since Rocket treats same-code catchers at the same base as a fatal collision).
+1. **Attach the fairing.** `GuardFairing` scans the path, query, and header views of every request in `on_request` and stashes the verdict in request-local state; it also registers the `400`/`403`/`413`/`429`/`500` catchers that render refusals (skipping statuses the application already registered, since Rocket treats same-code catchers at the same base as a fatal collision).
 2. **Add a guard argument to each protected route.** `BlockGuard` for routes without a body, `GuardBody` for routes with one. This is the part Rocket cannot automate: protection is per-route by design.
 
 ```rust
@@ -45,7 +45,7 @@ fn rocket() -> _ {
 }
 ```
 
-Routes without either guard argument are scanned but not blocked. The fairing additionally rewrites a `404` to the guarded `403` when the verdict is a threat, so a threat to a path that matches no route does not leak a `404`; a `404` is proof that no handler ran, which is why that rewrite is safe.
+Routes without either guard argument are scanned but not blocked. The fairing additionally rewrites a `404` to the guarded refusal shape when the verdict is a block, so a threat to a path that matches no route does not leak a `404`; a `404` is proof that no handler ran, which is why that rewrite is safe.
 
 The full crate documentation is in [`src/lib.rs`](src/lib.rs) (build it with `cargo doc --open`).
 
@@ -66,13 +66,53 @@ The HTTP method is not fed to the engine: the engine's `detect(content, context,
 
 | Situation | Status | Body |
 |---|---|---|
-| Engine flags a view | `403 Forbidden` | `Suspicious activity detected` |
+| The IP gate denies the client IP | `403 Forbidden` | `Forbidden` |
+| A live ban on the client IP | `403 Forbidden` | `IP address banned` |
+| Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
+| Engine flags a view | `400 Bad Request` | `Suspicious activity detected` |
+| Engine flags a view and a crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
 | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
 | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
 
 The bodies follow the ecosystem's plain-text error convention (the bare message, `text/plain; charset=utf-8`, same as the Python family), but the adapter is deliberately **fail-secure**: unlike the TypeScript adapters, whose check pipeline logs and skips on error, any failure to complete the security check answers `500`, never an uninspected passthrough. A guard with no stashed verdict (fairing not attached) also refuses with `500`.
 
 Engine panics are caught with `catch_unwind`, so a detected panic still produces a response instead of unwinding out of the request. `panic = "abort"` in the release profile disables that recovery.
+
+
+## Rate limiting and IP banning
+
+Two opt-in builder methods install the engine's stateful stage, mirroring the reference pipeline's order (ban check first, then the limiter, both in `on_request` before the metadata scan and the guards):
+
+```rust
+use rocket_guard_rs::{GuardFairing, IpBanConfig, IpBanManager, RateLimitConfig, RateLimiter, ThreatBanEntry};
+
+let limiter = RateLimiter::new(RateLimitConfig {
+    enable_rate_limiting: true,
+    rate_limit: 30,
+    rate_limit_window: 10,
+    ..RateLimitConfig::default()
+})
+.expect("valid config");
+
+let manager = IpBanManager::new();
+let bans = IpBanConfig::new(
+    true,
+    10,
+    3600,
+    [("sqli", ThreatBanEntry { threshold: 3, duration: 1800 })],
+)
+.expect("valid config");
+
+let fairing = rocket_guard_rs::GuardFairing::with_defaults()
+    .with_rate_limiting(limiter)
+    .with_ip_banning(manager, bans);
+```
+
+- A rate-limit crossing answers `429 Too Many Requests` with `Retry-After: <window seconds>`. With the limiter's `enable_rate_limit_auto_ban` on, every crossing counts one `rate_limit` violation toward the auto-ban engine; the response stays `429` and the ban bites on the next request (`403 IP address banned`).
+- A live ban on the client IP answers `403 Forbidden` (`IP address banned`) before the limiter, so banned traffic never consumes rate budget.
+- Every detected threat counts its categories per client IP; a crossed `threat_ban_config` entry (or the flat `auto_ban_threshold`) bans on the spot, answering `403 Forbidden` (`IP has been banned`). `config.enable_ip_banning = false` counts violations but never bans.
+- Both stages honor the `exempt_ips` contract: whitelisted and exempt IPs are never rate limited, never banned, and never counted; unattributed requests (no client IP) skip the stage but are still detection-screened.
+- The limiter and the ban store pair are shared with the managed engine state, and the engine handles are cheaply clonable, so out-of-band handles (admin unban endpoints, stats) work alongside the installed fairing.
 
 ## Body cap
 
