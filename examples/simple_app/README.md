@@ -12,8 +12,8 @@ example itself holds no security logic.
 |---|---|---|
 | `GET /health` | excluded | `200 ok`; scanned by the fairing but never blocked (no guard argument) |
 | `GET /` | guarded | `200`, greeting text |
-| `GET /search?q=...` | guarded | `200 search ok`, or `403` when the query trips the engine |
-| `POST /echo` | guarded | echoes the request body; `403` for a threat, `413` over the body cap |
+| `GET /search?q=...` | guarded | `200 search ok`, or `400` when the query trips the engine |
+| `POST /echo` | guarded | echoes the request body; `400` for a threat, `413` over the body cap |
 | anything else | guarded | `404 not found` |
 
 `/health` demonstrates excluded-path behavior, the Rocket-shaped way: the
@@ -51,8 +51,8 @@ compose stack (on port 8080; set `SMOKE_PORT` to remap the host port):
 | `GET /` | `200` |
 | `GET /health` | `200` (excluded path) |
 | `GET /search?q=hello` | `200` |
-| `GET /search?q=<script>alert(1)</script>` | `403`, body `Suspicious activity detected` |
-| `GET /files/../../etc/passwd` (`--path-as-is`) | `403`, body `Suspicious activity detected` |
+| `GET /search?q=<script>alert(1)</script>` | `400`, body `Suspicious activity detected` |
+| `GET /files/../../etc/passwd` (`--path-as-is`) | `400`, body `Suspicious activity detected` |
 | `POST /echo` with a 300 KB body | `413`, body `Payload too large` (default cap: 262144 bytes) |
 | `POST /echo` with body `hello world` | `200`, body echoed |
 

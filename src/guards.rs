@@ -1,7 +1,9 @@
 //! The enforcement guards: `BlockGuard` for requests without a body,
 //! `GuardBody` for requests with one.
 
-use crate::scan::{GuardEngine, Verdict, metadata_verdict, record_enforced};
+use crate::scan::{
+    GuardEngine, Verdict, detect_block, metadata_verdict, record_enforced, sort_categories,
+};
 use rocket::data::{Data, FromData, Outcome as DataOutcome, ToByteUnit};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
@@ -15,8 +17,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// | Stashed verdict | Outcome |
 /// |---|---|
 /// | Clean | `Success`: the handler runs |
-/// | Threat | `Error(403)`: the bare `Suspicious activity detected` message |
+/// | Threat | `Error(400)`: the bare `Suspicious activity detected` message |
 /// | `IpBlocked` (IP gate denial) | `Error(403)`: the bare `Forbidden` message |
+/// | `Banned` (live ban) | `Error(403)`: the bare `IP address banned` message |
+/// | `ActivityBanned` (auto-ban fired on this request) | `Error(403)`: the bare `IP has been banned` message |
+/// | `RateLimited` (limiter crossing) | `Error(429)`: the bare `Too many requests` message with `Retry-After: <window>` |
 /// | Failed (engine panic) | `Error(500)`: the bare `Security check failed` message |
 /// | Missing (fairing not attached) | `Error(500)`: fail-secure |
 ///
@@ -51,11 +56,7 @@ impl<'r> FromRequest<'r> for BlockGuard {
             verdict => {
                 let enforced = verdict.unwrap_or(Verdict::Failed);
                 record_enforced(request, enforced);
-                let status = match enforced {
-                    Verdict::Threat | Verdict::IpBlocked => Status::Forbidden,
-                    _ => Status::InternalServerError,
-                };
-                Outcome::Error((status, ()))
+                Outcome::Error((enforced.status(), ()))
             }
         }
     }
@@ -93,7 +94,10 @@ impl<'r> FromRequest<'r> for BlockGuard {
 ///
 /// | Situation | Status | Body |
 /// |---|---|---|
-/// | Engine flags any view | `403 Forbidden` | `Suspicious activity detected` |
+/// | Engine flags any view | `400 Bad Request` | `Suspicious activity detected` |
+/// | Engine flags a view and a crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
+/// | IP gate denial, live ban | `403 Forbidden` | `Forbidden` / `IP address banned` |
+/// | Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
 /// | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
 /// | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
 #[derive(Debug)]
@@ -154,25 +158,24 @@ impl<'r> FromData<'r> for GuardBody {
 
         let verdict = catch_unwind(AssertUnwindSafe(|| {
             let metadata = metadata_verdict(request).unwrap_or(Verdict::Clean);
-            if matches!(
-                metadata,
-                Verdict::Threat | Verdict::IpBlocked | Verdict::Failed
-            ) {
+            if metadata != Verdict::Clean {
                 return metadata;
             }
-            if engine.scan_body(request, &bytes) {
-                Verdict::Threat
-            } else {
-                Verdict::Clean
-            }
+            // The body view, with the auto-ban engine attached: the flagged
+            // categories count for the client IP (the reference pipeline's
+            // suspicious-activity stage), and a crossed threshold bans on
+            // the spot.
+            engine
+                .scan_body(request, &bytes)
+                .map_or(Verdict::Clean, |categories| {
+                    detect_block(engine, request, sort_categories(categories).as_slice())
+                })
         }))
         .unwrap_or(Verdict::Failed);
 
         match verdict {
             Verdict::Clean => DataOutcome::Success(Self { bytes }),
-            Verdict::Threat => refused(request, Verdict::Threat, Status::Forbidden),
-            Verdict::IpBlocked => refused(request, Verdict::IpBlocked, Status::Forbidden),
-            Verdict::Failed => refused(request, Verdict::Failed, Status::InternalServerError),
+            verdict => refused(request, verdict, verdict.status()),
         }
     }
 }

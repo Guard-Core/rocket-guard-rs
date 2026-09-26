@@ -17,7 +17,7 @@ configuration.
   route-scoped guard configuration is not expressible; see the
   tower/axum/actix advanced examples for that demo.
 - **No 404 leaks.** A threat to a path that matches no route is answered with
-  the guarded `403` (the fairing rewrites the `404`), so probe traffic never
+  the guarded `400` (the fairing rewrites the `404`), so probe traffic never
   reveals route inventory.
 
 ## Configuration
@@ -39,11 +39,11 @@ configuration.
 |---|---|---|
 | `GET /health` | excluded | `200 ok` |
 | `GET /` | general | `200`, greeting text |
-| `GET /search?q=...` | general | `200`, or `403` on a threat |
-| `POST /echo` | general | echoes the body; `403`/`413` from the guard |
+| `GET /search?q=...` | general | `200`, or `400` on a threat |
+| `POST /echo` | general | echoes the body; `400`/`413` from the guard |
 | `GET /admin/stats` | guarded | `200 stats` |
 | `GET /open` | none (scanned, not blocked) | `200`, even for flagged requests |
-| anything else | fairing rewrite | threat to an unmatched path answers the guarded `403` |
+| anything else | fairing rewrite | a block on an unmatched path answers the guarded refusal shape |
 
 ## Not demonstrated (engine surface)
 
@@ -77,7 +77,7 @@ GUARD_BODY_CAP=65536 ROCKET_ADDRESS=127.0.0.1 ROCKET_PORT=8080 target/debug/rock
 |---|---|
 | `GET /health` | `200` |
 | `GET /admin/stats` | `200` |
-| `GET /search?q=<script>alert(1)</script>` | `403`, body `Suspicious activity detected` |
+| `GET /search?q=<script>alert(1)</script>` | `400`, body `Suspicious activity detected` |
 | `POST /echo` with a body over `GUARD_BODY_CAP` | `413`, body `Payload too large` |
 | `POST /echo` with a small body | `200`, body echoed |
 

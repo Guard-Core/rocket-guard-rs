@@ -9,8 +9,8 @@
 //! |---|---|---|
 //! | `GET /health` | none (excluded) | `200 ok`; scanned by the fairing but never blocked |
 //! | `GET /` | `BlockGuard` | `200` greeting |
-//! | `GET /search?q=...` | `BlockGuard` | `200 search ok`, or `403` when the query trips the engine |
-//! | `POST /echo` | `GuardBody` | echoes the body; `403` for a threat, `413` over the body cap |
+//! | `GET /search?q=...` | `BlockGuard` | `200 search ok`, or `400` when the query trips the engine |
+//! | `POST /echo` | `GuardBody` | echoes the body; `400` for a threat, `413` over the body cap |
 //!
 //! The `/health` route carries no guard argument, which is the Rocket-shaped
 //! excluded path: the fairing still scans it (request fairings see every
