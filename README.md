@@ -4,7 +4,7 @@ Application-layer security middleware for [Rocket](https://rocket.rs) 0.5, power
 
 Docs: <https://rennf93.github.io/rocket-guard-rs/>
 
-**Status:** Released. Version 1.1.0, published to crates.io. `GuardFairing`, `BlockGuard`, and `GuardBody` are working Rocket integration, screened by the engine.
+**Status:** Released. Version 1.2.0, published to crates.io. `GuardFairing`, `BlockGuard`, and `GuardBody` are working Rocket integration, screened by the engine.
 
 ## About
 
@@ -143,7 +143,7 @@ A body larger than the cap is rejected with `413` rather than forwarded unscanne
 
 ## Engine dependency
 
-The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.1.0 and carries paths pointing at the engine and facade crates inside a sibling `guard-core-rs` checkout so local builds and CI compile them from source. Registry note, stated plainly: the 4.1.0 dists of `guard-core-engine` and `guard-core-rs` are currently yanked on crates.io, so the published 1.1.0 of this crate cannot resolve its engine from the registry alone (a fresh `cargo add rocket-guard-rs` falls back to 1.0.0 with engine 4.0.4). Resolution is restored at the synchronized 4.2.0 train; until then the sibling path dependencies are the working route. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`.
+The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the engine and facade crates inside a sibling `guard-core-rs` checkout so local builds and CI compile them from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so 1.1.0 could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`rocket-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`.
 
 The engine crate is `guard-core-engine` rather than the `guard-core-rs` facade because the facade currently re-exports only `compiler`, `preprocessor`, and `semantic`; `detect` (the entry point this adapter uses) is not re-exported there yet.
 

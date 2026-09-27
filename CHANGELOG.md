@@ -2,7 +2,11 @@
 
 All notable changes to this project.
 
-## [Unreleased]
+## [1.2.0] - 2026-09-27
+
+### Note
+
+- Trains with the engine: `guard-core-engine` and `guard-core-rs` floors move to 4.2.0 (the 4.1.0 engine dists were yanked; this release restores registry resolution)
 
 ### Added
 
