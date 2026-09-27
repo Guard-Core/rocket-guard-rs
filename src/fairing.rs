@@ -2,12 +2,18 @@
 
 use crate::response;
 use crate::scan::{
-    GuardEngine, Metadata, Verdict, detect_block, record_gate_decision, sort_categories,
-    state_stage,
+    GuardEngine, Metadata, Verdict, metadata_threat_verdict, record_gate_decision, stage_decision,
 };
+use guard_core_engine::detection_exclusions::DetectionExclusionConfig;
+use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
+use guard_core_engine::geo::GeoIpHandler;
 use guard_core_engine::ip_ban::{IpBanConfig, IpBanManager, ViolationCounters};
 use guard_core_engine::ip_gate::IpGateVerdict;
-use guard_core_engine::rate_limit::RateLimiter;
+use guard_core_engine::rate_limit::{RateLimitConfig, RateLimiter};
+use guard_core_rs::events::SecurityEventBus;
+use guard_core_rs::responses::{CustomErrorResponses, OnBlockHook};
+use guard_core_rs::tower::RouteRateResolver;
+use guard_core_rs::tower::{ObservabilityConfig, RateLimitStage, RateLimitStageConfig};
 use rocket::Data;
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::Status;
@@ -15,6 +21,7 @@ use rocket::request::Request;
 use rocket::response::Response;
 use rocket::{Build, Rocket};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 /// Screens every request through the Guard engine before routing, and
 /// registers the catchers that render the refusals.
@@ -69,6 +76,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 pub struct GuardFairing {
     engine: GuardEngine,
     ip_gate: Option<guard_core_engine::ip_gate::IpGateConfig>,
+    route_tiers: Option<RouteRateResolver>,
+    geo_handler: Option<std::sync::Arc<dyn GeoIpHandler>>,
+    events: Option<std::sync::Arc<SecurityEventBus>>,
+    observability: Option<ObservabilityConfig>,
+    on_block: Option<OnBlockHook>,
+    custom_error_responses: CustomErrorResponses,
+    passive_mode: bool,
+    distributed: Option<(std::sync::Arc<dyn SlidingWindowStore>, String, bool)>,
+    distributed_ban_store: Option<std::sync::Arc<dyn BanStore>>,
+    detection_exclusions: Option<DetectionExclusionConfig>,
+    route_exclusions: Option<crate::scan::RouteExclusionsResolver>,
+    scan_fn: crate::ScanFn,
 }
 
 impl GuardFairing {
@@ -83,6 +102,18 @@ impl GuardFairing {
         Self {
             engine: GuardEngine::new(config),
             ip_gate: None,
+            route_tiers: None,
+            geo_handler: None,
+            events: None,
+            observability: None,
+            on_block: None,
+            custom_error_responses: CustomErrorResponses::new(),
+            passive_mode: false,
+            distributed: None,
+            distributed_ban_store: None,
+            detection_exclusions: None,
+            route_exclusions: None,
+            scan_fn: guard_core_engine::detection_exclusions::scan_request,
         }
     }
 
@@ -181,8 +212,10 @@ impl GuardFairing {
     /// `403 Forbidden` (`IP address banned`), before rate limiting. The
     /// stage's violation counters feed the auto-ban engine exactly like the
     /// reference pipeline's suspicious-activity stage: every detected threat
-    /// counts its categories per client IP (exempt and whitelisted IPs never
-    /// count - the `exempt_ips` contract), and a crossed `threat_ban_config`
+    /// counts its categories per client IP (whitelisted IPs never count - the
+    /// reference suspicious-activity stage skips a whitelisted IP only;
+    /// exempt IPs DO count, which makes a crossed threshold ban even an
+    /// exempt attacker), and a crossed `threat_ban_config`
     /// entry (or the flat `auto_ban_threshold`) bans on the spot, answering
     /// `403 Forbidden` (`IP has been banned`). The config's
     /// `enable_ip_banning` switch gates all of it; with it off the stage
@@ -244,11 +277,234 @@ impl GuardFairing {
         self.engine.body_cap
     }
 
-    /// Substitute the detector. Test-only: exercises the fail-secure path.
-    #[cfg(test)]
-    pub(crate) fn with_detect_fn(mut self, detect_fn: crate::DetectFn) -> Self {
-        self.engine.detect_fn = detect_fn;
+    /// Install the per-route rate-limit tier resolver:
+    /// `path -> Option<RouteRateLimits>` (the tower counterpart of the
+    /// reference's `request.state.route_config`). A
+    /// [`RouteRateLimits`](crate::RouteRateLimits) request override, when a host sets one via [`crate::set_route_rate_limits`],
+    /// wins over the resolver. The tier's `rate_limit`/`rate_limit_window`
+    /// (and its per-country `geo_rate_limits`, resolved through
+    /// [`GuardFairing::with_geo_handler`]) apply on top of the global tier;
+    /// the first tier that crosses decides, answering the same
+    /// `429 + Retry-After` shape.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rocket_guard_rs::{GuardFairing, RouteRateLimits, default_config};
+    /// use std::sync::Arc;
+    ///
+    /// let fairing = GuardFairing::new(default_config()).with_route_tiers(Arc::new(|path| {
+    ///     if path.starts_with("/login") {
+    ///         Some(RouteRateLimits::new(Some(5), None, None).expect("valid tiers"))
+    ///     } else {
+    ///         None
+    ///     }
+    /// }));
+    /// # let _ = fairing;
+    /// ```
+    #[must_use]
+    pub fn with_route_tiers(mut self, resolver: RouteRateResolver) -> Self {
+        self.route_tiers = Some(resolver);
         self
+    }
+
+    /// Install the geolocation seam the geo rate-limit tier resolves
+    /// through (`geo_handler.get_country(ip)`; the MMDB reading is the
+    /// host's work, [`GeoIpHandler`] is the engine trait). Without a
+    /// handler the geo tier never applies, exactly the reference's
+    /// `if not geo_handler: return None`.
+    #[must_use]
+    pub fn with_geo_handler(mut self, handler: Arc<dyn GeoIpHandler>) -> Self {
+        self.geo_handler = Some(handler);
+        self
+    }
+
+    /// Install the [`SecurityEventBus`] the stage's security events
+    /// dispatch through (`penetration_attempt`, `rate_limited`,
+    /// `ip_banned`, with the reference fields and metadata). Handlers
+    /// receive every event and own the transport.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
+    /// Install the observability knobs ([`ObservabilityConfig`]): the
+    /// `log_suspicious_level` (`None` composes no suspicious line), the
+    /// `muted_check_logs` set, and the `log_sensitive_headers` /
+    /// `log_sensitive_params` / `log_sensitive_body_fields` redaction sets
+    /// (merged over the engine defaults) that the suspicious log lines,
+    /// the event endpoint/user-agent fields, and the `on_block` payload
+    /// redact through.
+    #[must_use]
+    pub fn with_observability(mut self, observability: ObservabilityConfig) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// Install the reference `on_block` callback: fired exactly once per
+    /// blocked request (and once per passive-flagged detection, with
+    /// `status_code = None`) with the reference [`BlockPayload`](crate::BlockPayload) keys
+    /// (check name, reason, trigger, redacted path, method, status).
+    /// Matching the engine stage's contract, the hook receives redacted
+    /// payloads only when an [`ObservabilityConfig`] is installed.
+    #[must_use]
+    pub fn with_on_block(mut self, hook: OnBlockHook) -> Self {
+        self.on_block = Some(hook);
+        self
+    }
+
+    /// Install the reference `custom_error_responses` map: status code to
+    /// message body, overriding the family default for that status on
+    /// every block answer the guard renders (`429`, both `403` banned
+    /// shapes, the `503` Redis-unavailable shape, and the `400`
+    /// detection block).
+    #[must_use]
+    pub fn with_custom_error_responses(
+        mut self,
+        custom_error_responses: CustomErrorResponses,
+    ) -> Self {
+        self.custom_error_responses = custom_error_responses;
+        self
+    }
+
+    /// Set the reference `passive_mode` (default `false`): log-only
+    /// security. Sliding windows and violation counters still record, the
+    /// log lines and events still fire, but no `400`/`403`/`429` is ever
+    /// rendered and the auto-ban feeds are suppressed - the reference's
+    /// passive paths.
+    #[must_use]
+    pub fn with_passive_mode(mut self, passive_mode: bool) -> Self {
+        self.passive_mode = passive_mode;
+        self
+    }
+
+    /// Run the limiter and ban engine over a distributed store (the
+    /// reference `enable_redis && redis_handler` conjunction): a
+    /// [`SlidingWindowStore`] plus the reference `redis_prefix` and
+    /// `redis_fail_open` knobs. `redis_fail_open = false` (the default)
+    /// answers the fail-closed `503 "Redis rate limiting unavailable"` on
+    /// a backend error; `true` degrades to the in-memory window. Install
+    /// a [`BanStore`] alongside with
+    /// [`GuardFairing::with_distributed_ban_store`]. The traits are
+    /// engine-side and client-free; `guard-core-rs`' `redis` feature
+    /// ships a ready `RedisStore` backend.
+    #[must_use]
+    pub fn with_distributed_store(
+        mut self,
+        window_store: Arc<dyn SlidingWindowStore>,
+        redis_prefix: &str,
+        redis_fail_open: bool,
+    ) -> Self {
+        self.distributed = Some((window_store, redis_prefix.to_owned(), redis_fail_open));
+        self
+    }
+
+    /// Attach the distributed ban store the ban engine shares (the
+    /// reference `{prefix}banned_ips:{ip}` namespace). Only meaningful
+    /// together with [`GuardFairing::with_distributed_store`].
+    #[must_use]
+    pub fn with_distributed_ban_store(mut self, ban_store: Arc<dyn BanStore>) -> Self {
+        self.distributed_ban_store = Some(ban_store);
+        self
+    }
+
+    /// Install the global detection-exclusion config
+    /// ([`DetectionExclusionConfig`], the reference `SecurityConfig`
+    /// fields of the same names): `excluded_detection_headers` (merged
+    /// with the engine defaults), `excluded_detection_params`,
+    /// `excluded_detection_body_fields`, `enabled_detection_categories`,
+    /// and `detection_scan_body`. A
+    /// [`RouteDetectionExclusions`](crate::RouteDetectionExclusions) route resolver (the per-route
+    /// decorator surface) resolves on top of it per request: a non-`None`
+    /// route value replaces the global set for that surface (the header
+    /// set always merges).
+    #[must_use]
+    pub fn with_detection_exclusions(
+        mut self,
+        detection_exclusions: DetectionExclusionConfig,
+    ) -> Self {
+        self.detection_exclusions = Some(detection_exclusions);
+        self
+    }
+
+    /// Install the per-route detection-exclusion resolver
+    /// (`path -> Option<RouteDetectionExclusions>`); a request's route
+    /// exclusion resolves on top of the global config per request: a
+    /// non-`None` route value replaces the global set for that surface
+    /// (the header set always merges). Rocket also exposes the request-
+    /// local setter [`crate::set_route_detection_exclusions`] for hosts that
+    /// resolve the route earlier in the request.
+    #[must_use]
+    pub fn with_route_detection_exclusions(
+        mut self,
+        resolver: crate::scan::RouteExclusionsResolver,
+    ) -> Self {
+        self.route_exclusions = Some(resolver);
+        self
+    }
+
+    /// Build the engine stage from the configured handles and seams; every
+    /// injected config is already validated (the `with_*` builders take
+    /// pre-validated engine objects), so the build cannot fail.
+    #[cfg(test)]
+    pub(crate) fn with_scan_fn(mut self, scan_fn: crate::ScanFn) -> Self {
+        self.scan_fn = scan_fn;
+        self
+    }
+
+    pub(crate) fn build_stage(&self) -> RateLimitStage {
+        let rate_limit = self.engine.rate_limiter.as_deref().map_or(
+            RateLimitConfig {
+                enable_rate_limiting: false,
+                ..RateLimitConfig::default()
+            },
+            |limiter| limiter.config().clone(),
+        );
+        let ip_ban = self.engine.ban_state.as_deref().map_or(
+            IpBanConfig {
+                enable_ip_banning: false,
+                ..IpBanConfig::default()
+            },
+            |state| state.config.clone(),
+        );
+        let mut builder = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit,
+            ip_ban,
+            passive_mode: self.passive_mode,
+            custom_error_responses: self.custom_error_responses.clone(),
+        });
+        if let Some(limiter) = &self.engine.rate_limiter {
+            builder = builder.limiter(limiter.as_ref().clone());
+        }
+        if let Some(state) = &self.engine.ban_state {
+            builder = builder.ban_manager(state.manager.clone(), state.counters.clone());
+        }
+        if let Some(resolver) = &self.route_tiers {
+            let resolver = std::sync::Arc::clone(resolver);
+            builder = builder.route_resolver(move |path| resolver(path));
+        }
+        if let Some(handler) = &self.geo_handler {
+            builder = builder.geo_handler(std::sync::Arc::clone(handler));
+        }
+        if let Some(bus) = &self.events {
+            builder = builder.events(std::sync::Arc::clone(bus));
+        }
+        if let Some(observability) = &self.observability {
+            builder = builder.observability(observability.clone());
+        }
+        if let Some(hook) = &self.on_block {
+            builder = builder.on_block(std::sync::Arc::clone(hook));
+        }
+        if let Some((store, prefix, fail_open)) = &self.distributed {
+            builder = builder.distributed_store(std::sync::Arc::clone(store), prefix, *fail_open);
+        }
+        if let Some(ban_store) = &self.distributed_ban_store {
+            builder = builder.distributed_ban_store(std::sync::Arc::clone(ban_store));
+        }
+        builder
+            .build()
+            .expect("guard configs are validated by their constructors")
     }
 }
 
@@ -271,7 +527,19 @@ impl Fairing for GuardFairing {
 
     async fn on_ignite(&self, mut rocket: Rocket<Build>) -> rocket::fairing::Result {
         if rocket.state::<GuardEngine>().is_none() {
-            rocket = rocket.manage(self.engine.clone());
+            let mut engine = self.engine.clone();
+            engine
+                .detection_exclusions
+                .clone_from(&self.detection_exclusions);
+            engine.route_exclusions.clone_from(&self.route_exclusions);
+            engine.scan_fn = self.scan_fn;
+            engine.observability.clone_from(&self.observability);
+            engine.on_block.clone_from(&self.on_block);
+            engine
+                .custom_error_responses
+                .clone_from(&self.custom_error_responses);
+            engine.stage = Some(std::sync::Arc::new(self.build_stage()));
+            rocket = rocket.manage(engine);
         }
 
         // Rocket aborts the launch when two catchers claim the same code at
@@ -304,7 +572,7 @@ impl Fairing for GuardFairing {
             && let Some(verdict) = verdict
             && !matches!(verdict, Verdict::Clean | Verdict::Failed)
         {
-            *response = response::verdict_response(verdict);
+            *response = response::verdict_response(request, verdict);
         }
     }
 }
@@ -315,6 +583,15 @@ impl GuardFairing {
     /// rate limiting), then the metadata views, each recovered from an engine
     /// panic as fail-secure.
     fn evaluate(&self, request: &Request<'_>) -> Verdict {
+        // The managed engine state is authoritative (it carries the synced
+        // scan entry, the exclusion config, and the built stage); the
+        // fairing's own copy is only the fallback for a request evaluated
+        // outside a running rocket instance.
+        let engine = request
+            .rocket()
+            .state::<GuardEngine>()
+            .unwrap_or(&self.engine);
+        let _ = &self.engine;
         if let Some(gate) = &self.ip_gate
             && let Some(ip) = request.client_ip()
         {
@@ -324,27 +601,27 @@ impl GuardFairing {
             }
         }
 
-        // The stateful stage runs on every attributed, non-exempt request
-        // before the scan: a banned or throttled client never reaches
-        // detection (banned traffic never consumes rate budget, and the ban
-        // check precedes the limiter).
-        if let Some(verdict) = state_stage(&self.engine, request) {
+        // The metadata views (path, query, headers) scan first; the body
+        // view scans later, in the route's data guard - Rocket's
+        // `on_request` never sees the body, which is why this adapter's
+        // flow is two-phase (see the module docs).
+        let Ok(metadata) = catch_unwind(AssertUnwindSafe(|| engine.scan_metadata(request))) else {
+            return Verdict::Failed;
+        };
+
+        // One engine-stage pass decides for every request: bans first (403
+        // `IP address banned`), then the rate-limit tiers (429 +
+        // `Retry-After`), then the metadata finding (the auto-ban engine
+        // may answer `403 IP has been banned` on this very request) - the
+        // reference pipeline order. The window records exactly once here;
+        // the body finding feeds later through `feed_finding`.
+        if let Some((verdict, _)) = stage_decision(engine, request, metadata.as_ref()) {
             return verdict;
         }
 
-        match catch_unwind(AssertUnwindSafe(|| {
-            self.engine
-                .scan_metadata(request)
-                .map_or(Verdict::Clean, |categories| {
-                    detect_block(
-                        &self.engine,
-                        request,
-                        sort_categories(categories).as_slice(),
-                    )
-                })
-        })) {
-            Ok(verdict) => verdict,
-            Err(_) => Verdict::Failed,
+        match metadata {
+            Some(verdict) => metadata_threat_verdict(engine, request, &verdict),
+            None => Verdict::Clean,
         }
     }
 }
@@ -353,12 +630,16 @@ impl GuardFairing {
 mod tests {
     use super::*;
     use crate::{BlockGuard, FAILURE_MESSAGE, IpGateConfig};
-    use guard_core_engine::detect::{DetectConfig, DetectVerdict};
+    use guard_core_engine::detect::DetectConfig;
     use rocket::get;
     use rocket::local::asynchronous::Client;
     use rocket::routes;
 
-    fn panicking_detect(_content: &str, _view: &str, _config: &DetectConfig) -> DetectVerdict {
+    fn panicking_scan(
+        _surfaces: &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+        _exclusions: &guard_core_engine::detection_exclusions::ResolvedExclusions,
+        _config: &DetectConfig,
+    ) -> guard_core_engine::detection_exclusions::RequestScanVerdict {
         panic!("engine exploded");
     }
 
@@ -372,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_panic_is_recovered_as_a_500() {
-        let fairing = GuardFairing::with_defaults().with_detect_fn(panicking_detect);
+        let fairing = GuardFairing::with_defaults().with_scan_fn(panicking_scan);
         let client = Client::tracked(rocket::build().attach(fairing).mount("/", routes![hello]))
             .await
             .expect("valid rocket");
@@ -689,19 +970,37 @@ mod stateful_tests {
         ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BlockGuard, RATE_LIMITED_MESSAGE, RateLimitConfig,
         RateLimiter, ThreatBanEntry,
     };
+    use crate::{DetectionExclusionConfig, RouteDetectionExclusions, RouteRateLimits};
     use guard_core_engine::ip_ban::{Clock, IpBanConfig, IpBanManager};
     use rocket::get;
+    use rocket::http::Header;
     use rocket::http::Status;
     use rocket::local::asynchronous::{Client, LocalResponse};
+    use rocket::post;
     use rocket::routes;
     use std::net::IpAddr;
     use std::net::SocketAddr;
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[get("/hello")]
     fn hello_stateful(_guard: BlockGuard) -> &'static str {
+        "ok"
+    }
+
+    #[get("/login")]
+    fn login(_guard: BlockGuard) -> &'static str {
+        "ok"
+    }
+
+    #[get("/hello2")]
+    fn hello_plain(_guard: BlockGuard) -> &'static str {
+        "ok"
+    }
+
+    #[post("/echo", data = "<_body>")]
+    fn echo(_body: crate::GuardBody) -> &'static str {
         "ok"
     }
 
@@ -751,7 +1050,7 @@ mod stateful_tests {
         let client = Client::tracked(
             rocket::build()
                 .attach(fairing)
-                .mount("/", routes![hello_stateful]),
+                .mount("/", routes![hello_stateful, login]),
         )
         .await
         .expect("valid rocket");
@@ -819,7 +1118,7 @@ mod stateful_tests {
         let client = Client::tracked(
             rocket::build()
                 .attach(fairing)
-                .mount("/", routes![hello_stateful]),
+                .mount("/", routes![hello_stateful, login]),
         )
         .await
         .expect("valid rocket");
@@ -886,7 +1185,7 @@ mod stateful_tests {
         // ...and over the rate limiter: banned traffic never consumes budget.
         let (status, body, _) = attack_status(fairing, "192.0.2.55").await;
         assert_eq!(status, Status::Forbidden);
-        assert_eq!(body, BANNED_MESSAGE);
+        assert_eq!(body, crate::BANNED_MESSAGE);
     }
 
     #[tokio::test]
@@ -950,18 +1249,20 @@ mod stateful_tests {
     }
 
     #[tokio::test]
-    async fn exempt_ip_never_counts_detection_violations() {
-        // Checklist: the exempt flag makes violation counting observable -
-        // an exempt attacker can never be auto-banned.
+    async fn exempt_ip_violations_still_count_toward_the_ban() {
+        // Checklist: the exemption skips rate limiting, and the counting
+        // gate is the reference's whitelisted-only skip - so an exempt
+        // attacker's detections still feed the auto-ban engine and a
+        // crossed threshold bans on the spot.
         let gate = IpGateConfig::new(NIL, NIL, ["198.51.100.7"]).expect("valid lists");
         let config = IpBanConfig::new(
             true,
-            1,
+            100,
             3600,
             [(
                 "dir_traversal",
                 ThreatBanEntry {
-                    threshold: 1,
+                    threshold: 2,
                     duration: 60,
                 },
             )],
@@ -970,15 +1271,23 @@ mod stateful_tests {
         let fairing = GuardFairing::with_defaults()
             .with_ip_gate(gate)
             .with_ip_banning(IpBanManager::new(), config);
-        for _ in 0..3 {
-            let (status, body, _) = attack_status(fairing.clone(), "198.51.100.7").await;
-            assert_eq!(status, Status::BadRequest);
-            assert_eq!(
-                body,
-                crate::BLOCKED_MESSAGE,
-                "exempt violations are not counted, so no ban can fire"
-            );
-        }
+        let (status, body, _) = attack_status(fairing.clone(), "198.51.100.7").await;
+        assert_eq!(status, Status::BadRequest);
+        assert_eq!(
+            body,
+            crate::BLOCKED_MESSAGE,
+            "violation 1: the plain block shape"
+        );
+        let (status, body, _) = attack_status(fairing.clone(), "198.51.100.7").await;
+        assert_eq!(status, Status::Forbidden);
+        assert_eq!(
+            body,
+            crate::ACTIVITY_BANNED_MESSAGE,
+            "exempt violations count: the crossed threshold bans"
+        );
+        let (status, body, _) = full_status(fairing, "/hello", "198.51.100.7").await;
+        assert_eq!(status, Status::Forbidden);
+        assert_eq!(body, BANNED_MESSAGE);
     }
 
     #[tokio::test]
@@ -1028,5 +1337,313 @@ mod stateful_tests {
         let (status, body, _) = full_status(fairing, "/hello", "192.0.2.55").await;
         assert_eq!(status, Status::Forbidden);
         assert_eq!(body, BANNED_MESSAGE);
+    }
+    // ---- the wave surfaces, end to end through the public API ----
+
+    /// A static geolocation: every IP maps to `DE`.
+    struct StaticGeo;
+
+    impl guard_core_engine::geo::GeoIpHandler for StaticGeo {
+        fn get_country(&self, ip: IpAddr) -> Option<String> {
+            let _ = ip;
+            Some("DE".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn route_tier_resolver_limits_its_paths_only() {
+        let tiers = Arc::new(|path: &str| {
+            if path.starts_with("/login") {
+                Some(RouteRateLimits::new(Some(1), None, None).expect("valid tiers"))
+            } else {
+                None
+            }
+        });
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers);
+        let (status, _, _) = full_status(fairing.clone(), "/login", "192.0.2.71").await;
+        assert_eq!(status, Status::Ok);
+        let (status, body, retry_after) =
+            full_status(fairing.clone(), "/login", "192.0.2.71").await;
+        assert_eq!(status, Status::TooManyRequests);
+        assert_eq!(body, crate::RATE_LIMITED_MESSAGE);
+        assert_eq!(retry_after.as_deref(), Some("60"));
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.71").await;
+        assert_eq!(status, Status::Ok, "other paths keep the global tier");
+    }
+
+    #[tokio::test]
+    async fn geo_tier_limits_the_resolved_country() {
+        let mut geo = std::collections::HashMap::new();
+        geo.insert(
+            "DE".to_owned(),
+            guard_core_rs::tower::RateLimitEntry::new(1, 60).expect("valid entry"),
+        );
+        let tiers = Arc::new(move |_path: &str| {
+            Some(RouteRateLimits::new(None, None, Some(geo.clone())).expect("valid tiers"))
+        });
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers)
+            .with_geo_handler(Arc::new(StaticGeo));
+        let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.73").await;
+        assert_eq!(status, Status::Ok);
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.73").await;
+        assert_eq!(status, Status::TooManyRequests, "the DE tier crossed");
+    }
+
+    #[tokio::test]
+    async fn geo_tier_never_applies_without_a_handler() {
+        let mut geo = std::collections::HashMap::new();
+        geo.insert(
+            "DE".to_owned(),
+            guard_core_rs::tower::RateLimitEntry::new(1, 60).expect("valid entry"),
+        );
+        let tiers = Arc::new(move |_path: &str| {
+            Some(RouteRateLimits::new(None, None, Some(geo.clone())).expect("valid tiers"))
+        });
+        let fairing = GuardFairing::with_defaults().with_route_tiers(tiers);
+        for _ in 0..5 {
+            let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.74").await;
+            assert_eq!(status, Status::Ok, "no handler: the geo tier is inert");
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_detection_params_pass_and_other_params_scan() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["q".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults().with_detection_exclusions(exclusions);
+        let (status, _, _) =
+            full_status(fairing.clone(), "/hello?q=1+OR+1%3D1", "192.0.2.75").await;
+        assert_eq!(status, Status::Ok, "the excluded param is not scanned");
+        let (status, _, _) = full_status(fairing, "/hello?page=1+OR+1%3D1", "192.0.2.75").await;
+        assert_eq!(
+            status,
+            Status::BadRequest,
+            "a non-excluded param still scans"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_detection_exclusions_resolver_overrides_the_global_config() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["q".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_detection_exclusions(exclusions)
+            .with_route_detection_exclusions(Arc::new(|_path| {
+                Some(RouteDetectionExclusions {
+                    excluded_detection_params: Some(vec![]),
+                    ..RouteDetectionExclusions::default()
+                })
+            }));
+        let (status, _, _) = full_status(fairing, "/hello?q=1+OR+1%3D1", "192.0.2.76").await;
+        assert_eq!(
+            status,
+            Status::BadRequest,
+            "the route re-enables the param surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_scan_body_false_skips_the_body_surface() {
+        let exclusions = DetectionExclusionConfig {
+            detection_scan_body: Some(false),
+            ..DetectionExclusionConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults().with_detection_exclusions(exclusions);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_plain, echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .post("/echo")
+            .header(Header::new("Content-Type", "text/plain".to_owned()))
+            .body(b"SELECT * FROM users".as_slice())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "the body does not scan");
+        let (status, _, _) = full_status(
+            GuardFairing::with_defaults(),
+            "/files/../../etc/passwd",
+            "192.0.2.77",
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "the path still scans");
+    }
+
+    /// The `on_block` collector: the payloads the guard fired.
+    fn block_collector() -> (
+        Arc<Mutex<Vec<guard_core_rs::responses::BlockPayload>>>,
+        guard_core_rs::responses::OnBlockHook,
+    ) {
+        let payloads: Arc<Mutex<Vec<guard_core_rs::responses::BlockPayload>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&payloads);
+        let hook: guard_core_rs::responses::OnBlockHook =
+            Arc::new(move |payload| sink.lock().expect("payloads").push(payload.clone()));
+        (payloads, hook)
+    }
+
+    #[tokio::test]
+    async fn on_block_fires_for_the_detection_block_and_custom_body_overrides_it() {
+        let (payloads, hook) = block_collector();
+        let fairing = GuardFairing::with_defaults()
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook)
+            .with_custom_error_responses(
+                [(400u16, "blocked:custom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+        let (status, body, _) = attack_status(fairing, "192.0.2.78").await;
+        assert_eq!(status, Status::BadRequest);
+        assert_eq!(
+            body, "blocked:custom",
+            "the custom body overrides the default"
+        );
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        assert_eq!(payloads[0].check_name, "suspicious_activity");
+        assert_eq!(payloads[0].status_code, Some(400));
+        assert!(!payloads[0].passive_mode);
+    }
+
+    #[tokio::test]
+    async fn custom_error_responses_override_the_throttled_body() {
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(1, false))
+            .with_custom_error_responses(
+                [(429u16, "slow down:custom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+        let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.79").await;
+        assert_eq!(status, Status::Ok);
+        let (status, body, retry_after) = full_status(fairing, "/hello", "192.0.2.79").await;
+        assert_eq!(status, Status::TooManyRequests);
+        assert_eq!(body, "slow down:custom");
+        assert_eq!(retry_after.as_deref(), Some("60"), "Retry-After survives");
+    }
+
+    #[tokio::test]
+    async fn passive_mode_records_but_never_blocks() {
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(1, false))
+            .with_passive_mode(true);
+        let (status, _, _) =
+            full_status(fairing.clone(), "/hello?q=1+OR+1%3D1", "192.0.2.80").await;
+        assert_eq!(
+            status,
+            Status::Ok,
+            "passive: the detection block is log-only"
+        );
+        let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.81").await;
+        assert_eq!(status, Status::Ok);
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.81").await;
+        assert_eq!(status, Status::Ok, "passive: no 429 is rendered");
+    }
+
+    #[tokio::test]
+    async fn event_bus_receives_the_rate_limited_event() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let bus = Arc::new(
+            guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(move |event| {
+                sink.lock().expect("events").push(event.clone());
+            })),
+        );
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(1, false))
+            .with_event_bus(bus);
+        let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.82").await;
+        assert_eq!(status, Status::Ok);
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.82").await;
+        assert_eq!(status, Status::TooManyRequests);
+        let events = events.lock().expect("events");
+        assert!(
+            events.iter().any(|event| event.event_type == "rate_limited"
+                && event.action_taken == "request_blocked"
+                && event.handler_name.as_deref() == Some("rate_limit")),
+            "the rate_limited event fired: {events:?}"
+        );
+    }
+
+    /// A distributed store that always fails (the backend is down).
+    struct DownStore;
+
+    impl guard_core_rs::tower::SlidingWindowStore for DownStore {
+        fn record_hit(
+            &self,
+            _key: &str,
+            _now: f64,
+            _window: u64,
+        ) -> Result<u64, guard_core_engine::distributed::StoreError> {
+            Err(guard_core_engine::distributed::StoreError(String::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_store_fail_closed_answers_the_503_shape() {
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(10, false))
+            .with_distributed_store(
+                Arc::new(DownStore) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                false,
+            );
+        let (status, body, retry_after) = full_status(fairing, "/hello", "192.0.2.83").await;
+        assert_eq!(
+            status,
+            Status::ServiceUnavailable,
+            "fail-closed backend error"
+        );
+        assert_eq!(body, "Redis rate limiting unavailable");
+        assert_eq!(retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn distributed_store_fail_open_degrades_to_memory() {
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(1, false))
+            .with_distributed_store(
+                Arc::new(DownStore) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                true,
+            );
+        let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.84").await;
+        assert_eq!(status, Status::Ok);
+        let (status, body, _) = full_status(fairing, "/hello", "192.0.2.84").await;
+        assert_eq!(status, Status::TooManyRequests, "memory window decided");
+        assert_eq!(body, crate::RATE_LIMITED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn custom_error_responses_reach_the_banned_shapes() {
+        let manager = IpBanManager::new();
+        let config = IpBanConfig::new(true, 10, 3600, no_entries()).expect("valid config");
+        let fairing = GuardFairing::with_defaults()
+            .with_ip_banning(manager.clone(), config)
+            .with_custom_error_responses(
+                [(403u16, "denied:custom".to_owned())].into_iter().collect(),
+            );
+        manager
+            .ban_ip(IpAddr::from_str("192.0.2.85").expect("ip"), 60, "operator")
+            .expect("ban");
+        let (status, body, _) = full_status(fairing, "/hello", "192.0.2.85").await;
+        assert_eq!(status, Status::Forbidden);
+        assert_eq!(
+            body, "denied:custom",
+            "the live-ban shape takes the override"
+        );
     }
 }

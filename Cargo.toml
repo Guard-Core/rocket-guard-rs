@@ -22,6 +22,12 @@ name = "rocket_guard_rs"
 # (see .github/workflows/ci.yml) exercise the engine from source. The version
 # pin stays in lockstep with the published engine release.
 guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", version = "4.1.0" }
+# The engine facade (the event bus, observability knobs, the on_block hook,
+# custom error responses, and the rate-limit stage the fairing delegates to).
+# Path points at the sibling guard-core-rs checkout so local builds and CI
+# exercise it from source; the version pin stays in lockstep with the
+# published facade release.
+guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.1.0" }
 rocket = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
