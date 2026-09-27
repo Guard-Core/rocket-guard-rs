@@ -572,7 +572,7 @@ with the published engine release.</p>
 curl<span class="w"> </span>-i<span class="w"> </span><span class="s1">'http://127.0.0.1:8080/submit?cmd=$(whoami)'</span>
 </code></pre></div>
 <p>The first request answers <code>200 OK</code>; the second is blocked by the engine with
-<code>403 Forbidden</code> and a <code>Suspicious activity detected</code> body.</p>
+<code>400 Bad Request</code> and a <code>Suspicious activity detected</code> body.</p>
 <h2 id="building-from-source">Building from source</h2>
 <p>The repository itself consumes the engine as a local path dependency on a
 sibling <code>guard-core-rs</code> checkout (see the repository README), so building the

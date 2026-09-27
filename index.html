@@ -626,14 +626,14 @@ Rocket requires:</p>
 <li><strong>Attach <code>GuardFairing</code></strong> (<code>Kind::Ignite | Kind::Request |
    Kind::Response</code>). Its <code>on_request</code> scans the path, query, and header views
    and stashes the verdict in request-local state. Its <code>on_ignite</code> registers
-   the <code>403</code>/<code>413</code>/<code>500</code> catchers that render refusals as the ecosystem's
+   the <code>400</code>/<code>403</code>/<code>413</code>/<code>429</code>/<code>500</code> catchers that render refusals as the ecosystem's
    plain-text error shape.</li>
 <li><strong>Add a guard argument to each protected route</strong>: <code>BlockGuard</code> for routes
    without a body, <code>GuardBody</code> for routes with one. Protection is per-route,
    and the guard argument is Rocket's own mechanism for it.</li>
 </ol>
 <p>Routes without either guard argument are scanned but not blocked. The
-fairing additionally rewrites a <code>404</code> to the guarded <code>403</code> when the verdict
+fairing additionally rewrites a <code>404</code> to the guarded refusal shape when the verdict
 is a threat, so a threat to a path that matches no route does not leak a
 <code>404</code>.</p>
 <h2 id="installation">Installation</h2>
@@ -709,9 +709,29 @@ adapters:</p>
 </thead>
 <tbody>
 <tr>
-<td>Engine flags a view</td>
+<td>The IP gate denies the client IP</td>
 <td><code>403 Forbidden</code></td>
+<td><code>Forbidden</code></td>
+</tr>
+<tr>
+<td>A live ban on the client IP</td>
+<td><code>403 Forbidden</code></td>
+<td><code>IP address banned</code></td>
+</tr>
+<tr>
+<td>Rate limit crossed</td>
+<td><code>429 Too Many Requests</code> (+ <code>Retry-After: &lt;window&gt;</code>)</td>
+<td><code>Too many requests</code></td>
+</tr>
+<tr>
+<td>Engine flags a view</td>
+<td><code>400 Bad Request</code></td>
 <td><code>Suspicious activity detected</code></td>
+</tr>
+<tr>
+<td>Engine flags a view and a crossed auto-ban threshold bans on the spot</td>
+<td><code>403 Forbidden</code></td>
+<td><code>IP has been banned</code></td>
 </tr>
 <tr>
 <td>Body exceeds the cap</td>

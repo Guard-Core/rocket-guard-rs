@@ -572,12 +572,12 @@ checkout (see the repository README).</p>
 <tr>
 <td><code>GET /search?q=...</code></td>
 <td><code>BlockGuard</code></td>
-<td><code>200 search ok</code>, or <code>403</code> when the query trips the engine</td>
+<td><code>200 search ok</code>, or <code>400</code> when the query trips the engine</td>
 </tr>
 <tr>
 <td><code>POST /echo</code></td>
 <td><code>GuardBody</code></td>
-<td>echoes the body; <code>403</code> for a threat, <code>413</code> over the body cap</td>
+<td>echoes the body; <code>400</code> for a threat, <code>413</code> over the body cap</td>
 </tr>
 </tbody>
 </table>
@@ -594,7 +594,7 @@ that demonstrates environment-driven engine configuration and the per-route
 enforcement split: guarded routes (<code>BlockGuard</code> / <code>GuardBody</code>) refuse
 threats, <code>/health</code> is excluded (no guard argument), and <code>/open</code> is scanned
 but deliberately not blocked. A threat to a path that matches no route is
-answered with the guarded <code>403</code> (the fairing rewrites the <code>404</code>), so probe
+answered with the guarded <code>400</code> (the fairing rewrites the <code>404</code>), so probe
 traffic never reveals route inventory.</p>
 <p>Note that route-scoped guard configuration is not expressible in this
 adapter: Rocket fairings are global and the adapter stores one verdict per
@@ -674,12 +674,12 @@ request. See the tower/axum/actix advanced examples for that demo.</p>
 <tr>
 <td><code>GET /search?q=...</code></td>
 <td>general</td>
-<td><code>200</code>, or <code>403</code> on a threat</td>
+<td><code>200</code>, or <code>400</code> on a threat</td>
 </tr>
 <tr>
 <td><code>POST /echo</code></td>
 <td>general</td>
-<td>echoes the body; <code>403</code>/<code>413</code> from the guard</td>
+<td>echoes the body; <code>400</code>/<code>413</code> from the guard</td>
 </tr>
 <tr>
 <td><code>GET /admin/stats</code></td>
@@ -694,7 +694,7 @@ request. See the tower/axum/actix advanced examples for that demo.</p>
 <tr>
 <td>anything else</td>
 <td>fairing rewrite</td>
-<td>threat to an unmatched path answers the guarded <code>403</code></td>
+<td>a block on an unmatched path answers the guarded refusal shape</td>
 </tr>
 </tbody>
 </table>

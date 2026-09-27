@@ -394,6 +394,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#the-rate-limiter-ratelimiter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The rate limiter: RateLimiter
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-ban-stage-ipbanmanager-ipbanconfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The ban stage: IpBanManager + IpBanConfig
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#catchers" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -655,6 +677,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#the-rate-limiter-ratelimiter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The rate limiter: RateLimiter
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-ban-stage-ipbanmanager-ipbanconfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The ban stage: IpBanManager + IpBanConfig
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#catchers" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -850,10 +894,11 @@ catchers. Attach it once on <code>rocket::build()</code>:</p>
 <div class="highlight"><pre><span></span><code><span class="n">rocket</span><span class="p">::</span><span class="n">build</span><span class="p">().</span><span class="n">attach</span><span class="p">(</span><span class="n">rocket_guard_rs</span><span class="p">::</span><span class="n">GuardFairing</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">config</span><span class="p">))</span>
 </code></pre></div>
 <p>Attach with <code>Kind::Ignite | Kind::Request | Kind::Response</code> (the default
-<code>Kind</code> set the fairing declares): <code>on_ignite</code> registers the <code>403</code>/<code>413</code>/<code>500</code>
-catchers, <code>on_request</code> scans the path, query, and header views and stashes
-the verdict in request-local state, and <code>on_response</code> supports the <code>404</code> to
-<code>403</code> rewrite described below.</p>
+<code>Kind</code> set the fairing declares): <code>on_ignite</code> registers the
+<code>400</code>/<code>403</code>/<code>413</code>/<code>429</code>/<code>500</code> catchers, <code>on_request</code> runs the IP gate, the
+stateful stage (dynamic bans, then rate limiting), and the path, query, and
+header views, stashing the verdict in request-local state, and
+<code>on_response</code> supports the <code>404</code> rewrite described below.</p>
 <p>Constructors and builders:</p>
 <table>
 <thead>
@@ -879,12 +924,21 @@ the verdict in request-local state, and <code>on_response</code> supports the <c
 <td><code>.with_ip_gate(ip_gate: IpGateConfig)</code></td>
 <td>Install the global IP gate (see below)</td>
 </tr>
+<tr>
+<td><code>.with_rate_limiting(limiter: RateLimiter)</code></td>
+<td>Install the rate limiter (see below)</td>
+</tr>
+<tr>
+<td><code>.with_ip_banning(manager: IpBanManager, config: IpBanConfig)</code></td>
+<td>Install the dynamic ban store and the auto-ban engine (see below)</td>
+</tr>
 </tbody>
 </table>
 <p>Routes without a guard argument are only scanned, not blocked: in Rocket,
 protection is per-route, and that is what the guard argument is for. When the
-verdict is a threat (or an IP-gate denial) and the request would otherwise
-answer <code>404</code>, the fairing rewrites the <code>404</code> to the guarded <code>403</code> so probe
+verdict is a block (a threat, an IP-gate denial, a live ban, an auto-ban
+firing, or a rate-limit crossing) and the request would otherwise answer
+<code>404</code>, the fairing rewrites the <code>404</code> to that verdict's family shape so probe
 traffic never reveals route inventory.</p>
 <h3 id="the-ip-gate-ipgateconfig">The IP gate: <code>IpGateConfig</code></h3>
 <p>Built with <code>IpGateConfig::new(whitelist, blacklist, exempt_ips)</code>, which fails
@@ -911,17 +965,67 @@ known-friendly automation (monitoring probes, VPN egress, a partner's
 server), not immunity: it sets the same skip state a whitelist match sets but
 never adds a deny path and never opens the whitelist gate. The blacklist,
 bans-style checks, and detection still apply to exempt IPs - an attack
-payload from an exempt IP is still <code>403 Suspicious activity detected</code>. The
-Rust family ships no rate limiter, user-agent filter, cloud-provider blocker,
-or violation counter yet; a stage that lands later must skip exactly what the
-reference skips for a whitelist match (<code>is_whitelisted || is_exempt</code>) and
-never skip detection.</p>
+payload from an exempt IP is still <code>400 Suspicious activity detected</code>. The
+stateful stages (<code>GuardFairing::with_rate_limiting</code>,
+<code>GuardFairing::with_ip_banning</code>) skip exactly what the reference skips for a
+whitelist match (<code>is_whitelisted || is_exempt</code>): rate limiting, violation
+counting, and banning. Detection never skips anything.</p>
+<h3 id="the-rate-limiter-ratelimiter">The rate limiter: <code>RateLimiter</code></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">rocket_guard_rs</span><span class="p">::{</span><span class="n">GuardFairing</span><span class="p">,</span><span class="w"> </span><span class="n">RateLimitConfig</span><span class="p">,</span><span class="w"> </span><span class="n">RateLimiter</span><span class="p">};</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">limiter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">RateLimiter</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">RateLimitConfig</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">enable_rate_limiting</span><span class="p">:</span><span class="w"> </span><span class="nc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="n">rate_limit</span><span class="p">:</span><span class="w"> </span><span class="mi">30</span><span class="p">,</span>
+<span class="w">    </span><span class="n">rate_limit_window</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="o">..</span><span class="n">RateLimitConfig</span><span class="p">::</span><span class="n">default</span><span class="p">()</span>
+<span class="p">})</span>
+<span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"valid config"</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">fairing</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GuardFairing</span><span class="p">::</span><span class="n">with_defaults</span><span class="p">().</span><span class="n">with_rate_limiting</span><span class="p">(</span><span class="n">limiter</span><span class="p">);</span>
+</code></pre></div>
+<p>The limiter's constructor fails closed on a zero limit or window. Installed
+with <code>GuardFairing::with_rate_limiting</code>, it runs in <code>on_request</code> after the IP
+gate and the ban stage, before the metadata scan: a crossing is refused with
+<code>429 Too Many Requests</code> carrying <code>Retry-After: &lt;window seconds&gt;</code>. With
+<code>enable_rate_limit_auto_ban</code> on and IP banning configured, every crossing
+counts one <code>rate_limit</code> violation toward the auto-ban engine; the response
+stays <code>429</code> and the ban bites on the next request. Requests without a client
+IP cannot be attributed and are not rate limited; detection still screens
+them. The limiter is shared with the managed engine state and clone-shares
+its window store, so out-of-band handles (stats, admin resets) work
+alongside the installed fairing.</p>
+<h3 id="the-ban-stage-ipbanmanager-ipbanconfig">The ban stage: <code>IpBanManager</code> + <code>IpBanConfig</code></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">rocket_guard_rs</span><span class="p">::{</span><span class="n">GuardFairing</span><span class="p">,</span><span class="w"> </span><span class="n">IpBanConfig</span><span class="p">,</span><span class="w"> </span><span class="n">IpBanManager</span><span class="p">,</span><span class="w"> </span><span class="n">ThreatBanEntry</span><span class="p">};</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">manager</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IpBanManager</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IpBanConfig</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">    </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">3600</span><span class="p">,</span>
+<span class="w">    </span><span class="p">[(</span><span class="s">"sqli"</span><span class="p">,</span><span class="w"> </span><span class="n">ThreatBanEntry</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">threshold</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="n">duration</span><span class="p">:</span><span class="w"> </span><span class="mi">1800</span><span class="w"> </span><span class="p">})],</span>
+<span class="p">)</span>
+<span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"valid config"</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">fairing</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GuardFairing</span><span class="p">::</span><span class="n">with_defaults</span><span class="p">().</span><span class="n">with_ip_banning</span><span class="p">(</span><span class="n">manager</span><span class="p">,</span><span class="w"> </span><span class="n">config</span><span class="p">);</span>
+</code></pre></div>
+<p>The config constructor fails closed on an invalid <code>threat_ban_config</code> entry.
+Installed with <code>GuardFairing::with_ip_banning</code>, the ban check runs in
+<code>on_request</code> before the limiter: a live ban is refused with <code>403 Forbidden</code>
+(<code>IP address banned</code>) and banned traffic never consumes rate budget. Every
+detected threat counts its categories per client IP (the reference
+pipeline's suspicious-activity stage), and a crossed <code>threat_ban_config</code>
+entry or the flat <code>auto_ban_threshold</code> bans on the spot, answering
+<code>403 Forbidden</code> (<code>IP has been banned</code>); without a crossing the block keeps
+the <code>400 Bad Request</code> (<code>Suspicious activity detected</code>) shape.
+<code>config.enable_ip_banning = false</code> counts violations but never bans.
+Whitelisted and exempt IPs are never counted, so they can never be
+auto-banned. The store pair is shared with the managed engine state and
+clone-shares its stores.</p>
 <h3 id="catchers">Catchers</h3>
-<p><code>guard_catchers() -&gt; Vec&lt;Catcher&gt;</code> returns the <code>403</code>/<code>413</code>/<code>500</code> catchers
-that render refusals as the ecosystem's plain-text error shape. The fairing
-registers them itself, skipping any status the application already registered
-a catcher for (Rocket treats same-code catchers at the same base as a fatal
-collision).</p>
+<p><code>guard_catchers() -&gt; Vec&lt;Catcher&gt;</code> returns the
+<code>400</code>/<code>403</code>/<code>413</code>/<code>429</code>/<code>500</code> catchers that render refusals as the
+ecosystem's plain-text error shape (the throttled shape carries the
+<code>Retry-After</code> header). The fairing registers them itself, skipping any
+status the application already registered a catcher for (Rocket treats
+same-code catchers at the same base as a fatal collision).</p>
 <h2 id="guards">Guards</h2>
 <h3 id="blockguard"><code>BlockGuard</code></h3>
 <p>A request guard for routes without a body argument:</p>
@@ -933,10 +1037,11 @@ collision).</p>
 <span class="w">    </span><span class="s">"hello"</span>
 <span class="p">}</span>
 </code></pre></div>
-<p>It enforces the verdict stashed by the fairing: a threat answers <code>403</code>, a
-failed check answers <code>500</code>. Fail-secure rule: if the guard cannot find a
-verdict, the security system is not running, and the request is refused
-rather than passed uninspected.</p>
+<p>It enforces the verdict stashed by the fairing: a threat answers <code>400</code>, a
+gate denial, live ban, or auto-ban answers <code>403</code>, a rate-limit crossing
+answers <code>429</code> (with <code>Retry-After</code>), and a failed check answers <code>500</code>.
+Fail-secure rule: if the guard cannot find a verdict, the security system is
+not running, and the request is refused rather than passed uninspected.</p>
 <h3 id="guardbody"><code>GuardBody</code></h3>
 <p>The scanned request body, usable as a data guard. Buffering, scanning, and
 handing the body to the handler are fused into one data guard because
@@ -1097,9 +1202,24 @@ whatever the handler does with the scanned bytes afterwards.</p>
 <td><code>Forbidden</code></td>
 </tr>
 <tr>
-<td>Engine flags a view</td>
+<td>A live ban on the client IP</td>
 <td><code>403 Forbidden</code></td>
+<td><code>IP address banned</code></td>
+</tr>
+<tr>
+<td>Rate limit crossed</td>
+<td><code>429 Too Many Requests</code> (+ <code>Retry-After: &lt;window&gt;</code>)</td>
+<td><code>Too many requests</code></td>
+</tr>
+<tr>
+<td>Engine flags a view</td>
+<td><code>400 Bad Request</code></td>
 <td><code>Suspicious activity detected</code></td>
+</tr>
+<tr>
+<td>Engine flags a view and a crossed auto-ban threshold bans on the spot</td>
+<td><code>403 Forbidden</code></td>
+<td><code>IP has been banned</code></td>
 </tr>
 <tr>
 <td>Body exceeds the cap</td>
@@ -1136,6 +1256,18 @@ disables that recovery).</p>
 <td><code>"Forbidden"</code></td>
 </tr>
 <tr>
+<td><code>BANNED_MESSAGE</code></td>
+<td><code>"IP address banned"</code></td>
+</tr>
+<tr>
+<td><code>ACTIVITY_BANNED_MESSAGE</code></td>
+<td><code>"IP has been banned"</code></td>
+</tr>
+<tr>
+<td><code>RATE_LIMITED_MESSAGE</code></td>
+<td><code>"Too many requests"</code></td>
+</tr>
+<tr>
 <td><code>OVERSIZE_MESSAGE</code></td>
 <td><code>"Payload too large"</code></td>
 </tr>
@@ -1149,8 +1281,14 @@ disables that recovery).</p>
 <p><code>DetectConfig</code>, <code>DetectVerdict</code>, and <code>Threat</code> are re-exported from
 <code>guard_core_engine::detect</code>.</p>
 <p><code>IpGateConfig</code>, <code>IpGateDecision</code>, <code>IpGateDenial</code>, <code>IpGateError</code>, and
-<code>IpGateVerdict</code> are re-exported from <code>guard_core_engine::ip_gate</code>. A <code>DetectVerdict</code> carries <code>is_threat</code>, a
-<code>threat_score</code>, and the list of <code>Threat</code> findings (regex or semantic).</p>
+<code>IpGateVerdict</code> are re-exported from <code>guard_core_engine::ip_gate</code>. A
+<code>DetectVerdict</code> carries <code>is_threat</code>, a <code>threat_score</code>, and the list of
+<code>Threat</code> findings (regex or semantic).</p>
+<p><code>RateLimiter</code>, <code>RateLimitConfig</code>, <code>RateLimitConfigError</code>, and
+<code>RateLimitDecision</code> are re-exported from <code>guard_core_engine::rate_limit</code>.</p>
+<p><code>IpBanManager</code>, <code>IpBanConfig</code>, <code>IpBanConfigError</code>, <code>BanError</code>, <code>BanRecord</code>,
+<code>Clock</code>, <code>ResolvedBan</code>, <code>ThreatBanEntry</code>, and <code>ViolationCounters</code> are
+re-exported from <code>guard_core_engine::ip_ban</code>.</p>
 
 
 
