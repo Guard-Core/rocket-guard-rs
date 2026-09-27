@@ -715,11 +715,13 @@ mod stateful_tests {
 
     /// An enabled rate limiter with the given limit and auto-ban switch.
     fn limiter(limit: u32, auto_ban: bool) -> RateLimiter {
+        #[allow(clippy::needless_update)] // forward-compatible against the pre-tier engine too
         RateLimiter::new(RateLimitConfig {
             enable_rate_limiting: true,
             rate_limit: limit,
             rate_limit_window: 60,
             enable_rate_limit_auto_ban: auto_ban,
+            ..RateLimitConfig::default()
         })
         .expect("valid config")
     }
