@@ -8,7 +8,7 @@ rocket-guard-rs is the Rocket adapter for the Guard ecosystem. It screens Rocket
 - **Repository**: https://github.com/rennf93/rocket-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
-- **Version**: 1.1.0 (published to crates.io)
+- **Version**: 1.2.0 (published to crates.io)
 - **Status**: implemented, tested, and published. The engine is a path dependency into a sibling `guard-core-rs` checkout; note the crates.io yank below (see [Engine Dependency](#engine-dependency)).
 
 ## Ecosystem Position
@@ -56,8 +56,8 @@ The method is not scanned: `detect` has no method parameter. Non-UTF-8 header va
 
 ## Engine Dependency
 
-- `Cargo.toml` pins `guard-core-engine` and `guard-core-rs` at 4.1.0 with paths into the sibling checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`).
-- Registry note, stated plainly: the 4.1.0 dists of `guard-core-engine` and `guard-core-rs` are currently yanked on crates.io, so the published 1.1.0 of this crate cannot resolve its engine from the registry alone (a fresh `cargo add rocket-guard-rs` falls back to 1.0.0 with engine 4.0.4). Resolution is restored at the synchronized 4.2.0 train; until then the sibling path dependencies are the working route.
+- `Cargo.toml` pins `guard-core-engine` and `guard-core-rs` at 4.2.0 with paths into the sibling checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`).
+- Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so 1.1.0 could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`rocket-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0).
 - The engine crate is used directly for `detect`; the facade dependency supplies the pipeline-side modules (events, geo, cloud provider, responses, and the rate-limit/ban stage wiring). The facade re-exports the full engine stage set since 4.1.0.
 - CI checks out `rennf93/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
 
