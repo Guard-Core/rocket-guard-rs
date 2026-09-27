@@ -321,6 +321,12 @@ pub(crate) fn verdict_from_stage(response: &StageResponse) -> (Verdict, Option<S
     match (response.status.as_u16(), response.body) {
         (403, crate::response::BANNED_MESSAGE) => (Verdict::Banned, custom),
         (403, _) => (Verdict::ActivityBanned, custom),
+        // The family contract's below-threshold detection answer: the
+        // stage serves the reference suspicious-activity `400 "Suspicious
+        // activity detected"` body itself (the only `400` shape the stage
+        // emits), which is the plain `Threat` block shape this adapter
+        // renders for a flagged attack.
+        (400, _) => (Verdict::Threat, custom),
         (429, _) => (
             Verdict::RateLimited(response.retry_after.unwrap_or(0)),
             custom,
