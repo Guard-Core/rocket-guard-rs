@@ -143,7 +143,13 @@ pub use crate::response::{
     ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
     OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, guard_catchers,
 };
+pub use crate::scan::{set_route_detection_exclusions, set_route_rate_limits};
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
+pub use guard_core_engine::detection_exclusions::{
+    DetectionExclusionConfig, RouteDetectionExclusions,
+};
+pub use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
+pub use guard_core_engine::geo::GeoIpHandler;
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, Clock, IpBanConfig, IpBanConfigError, IpBanManager, ResolvedBan,
     ThreatBanEntry, ViolationCounters,
@@ -152,10 +158,25 @@ pub use guard_core_engine::ip_gate::{
     IpGateConfig, IpGateDecision, IpGateDenial, IpGateError, IpGateVerdict,
 };
 pub use guard_core_engine::rate_limit::{
-    RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimiter,
+    RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
+    RateLimiter, RouteRateLimits, TierDecision,
+};
+pub use guard_core_rs::events::SecurityEventBus;
+pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
+pub use guard_core_rs::tower::{
+    ObservabilityConfig, RateLimitStage, RateLimitStageConfig, RequestObservation, StageResponse,
 };
 
-use std::net::IpAddr;
+/// The multi-surface scan entry point stored in the engine.
+///
+/// Indirection exists so unit tests can substitute a panicking scan and
+/// exercise the fail-secure path; production builds always store
+/// [`guard_core_engine::detection_exclusions::scan_request`].
+pub(crate) type ScanFn = fn(
+    &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+    &guard_core_engine::detection_exclusions::ResolvedExclusions,
+    &DetectConfig,
+) -> guard_core_engine::detection_exclusions::RequestScanVerdict;
 
 /// The stateful stage's ban half: the shared ban store, the shared violation
 /// counters (one fairing = one store pair), and the config that gates banning
@@ -174,28 +195,6 @@ impl core::fmt::Debug for BanState {
             .finish_non_exhaustive()
     }
 }
-
-impl BanState {
-    /// The auto-ban engine's one-call shape: count the categories, resolve
-    /// the thresholds, ban when one crossed.
-    pub(crate) fn register_violations(
-        &self,
-        ip: IpAddr,
-        categories: &[&str],
-        reason: &str,
-    ) -> Option<ResolvedBan> {
-        self.manager
-            .register_violations(&self.counters, ip, categories, &self.config, reason)
-    }
-}
-
-/// Engine entry point stored in the fairing.
-///
-/// Indirection exists so unit tests can substitute a panicking detector and
-/// exercise the fail-secure path; production builds always call
-/// [`guard_core_engine::detect::detect`].
-#[cfg(test)]
-pub(crate) type DetectFn = fn(&str, &str, &DetectConfig) -> DetectVerdict;
 
 /// Reference default detection configuration.
 ///

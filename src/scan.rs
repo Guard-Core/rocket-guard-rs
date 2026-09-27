@@ -5,16 +5,20 @@
 //! use to hand verdicts to each other (and to the catchers).
 
 use crate::BanState;
-use guard_core_engine::body_scan::extract_body_scan_values;
-use guard_core_engine::detect::{DetectConfig, Threat};
+use guard_core_engine::detect::DetectConfig;
+use guard_core_engine::detection_exclusions::{
+    DetectionExclusionConfig, RequestScanVerdict, RequestSurfaces, ResolvedExclusions,
+    RouteDetectionExclusions, resolve as resolve_exclusions,
+};
 use guard_core_engine::ip_gate::IpGateDecision;
+use guard_core_rs::responses::OnBlockHook;
+use guard_core_rs::tower::{
+    ObservabilityConfig, RateLimitStage, RequestObservation, StageResponse,
+};
 use rocket::Request;
 use rocket::http::Status;
 use rocket::http::uncased::UncasedStr;
-use std::net::IpAddr;
 use std::sync::Arc;
-
-use guard_core_engine::ip_ban::RATE_LIMIT_CATEGORY;
 
 /// Header names that are never scanned, mirroring the TypeScript adapters'
 /// `EXCLUDED_HEADERS` (plus every `sec-*` header).
@@ -51,6 +55,9 @@ pub(crate) enum Verdict {
     /// The rate limiter recorded a crossing; the payload is the
     /// `Retry-After` seconds (the window).
     RateLimited(u64),
+    /// The distributed backend failed with `redis_fail_open = false`; the
+    /// reference's fail-closed `503` shape.
+    RedisUnavailable,
     /// The engine panicked; fail secure.
     Failed,
 }
@@ -63,6 +70,7 @@ impl Verdict {
             Verdict::Threat => Status::BadRequest,
             Verdict::IpBlocked | Verdict::Banned | Verdict::ActivityBanned => Status::Forbidden,
             Verdict::RateLimited(_) => Status::TooManyRequests,
+            Verdict::RedisUnavailable => Status::ServiceUnavailable,
             Verdict::Failed => Status::InternalServerError,
         }
     }
@@ -95,11 +103,10 @@ pub(crate) struct GuardEngine {
     pub(crate) config: DetectConfig,
     /// Body buffering cap in bytes, enforced by [`crate::GuardBody`].
     pub(crate) body_cap: usize,
-    /// Detector indirection so unit tests can substitute a panicking
-    /// detector and exercise the fail-secure path; production builds always
-    /// store [`guard_core_engine::detect::detect`].
-    #[cfg(test)]
-    pub(crate) detect_fn: crate::DetectFn,
+    /// Scan indirection so unit tests can substitute a panicking scanner
+    /// and exercise the fail-secure path; production builds always store
+    /// [`guard_core_engine::detection_exclusions::scan_request`].
+    pub(crate) scan_fn: crate::ScanFn,
     /// The engine's sliding-window rate limiter, when
     /// [`GuardFairing::with_rate_limiting`](crate::GuardFairing::with_rate_limiting)
     /// installed one.
@@ -108,6 +115,22 @@ pub(crate) struct GuardEngine {
     /// [`GuardFairing::with_ip_banning`](crate::GuardFairing::with_ip_banning)
     /// installed one.
     pub(crate) ban_state: Option<Arc<BanState>>,
+    /// The global detection-exclusion config, when
+    /// [`GuardFairing::with_detection_exclusions`](crate::GuardFairing::with_detection_exclusions)
+    /// installed one.
+    pub(crate) detection_exclusions: Option<DetectionExclusionConfig>,
+    /// The per-route detection-exclusion resolver
+    /// (`path -> Option<RouteDetectionExclusions>`).
+    pub(crate) route_exclusions: Option<RouteExclusionsResolver>,
+    /// The engine facade's rate-limit stage: every stateful decision and
+    /// emission goes through it. Built by the fairing in `on_ignite`.
+    pub(crate) stage: Option<Arc<RateLimitStage>>,
+    /// The observability knobs (for the adapter-rendered `400` block).
+    pub(crate) observability: Option<ObservabilityConfig>,
+    /// The reference `on_block` hook (for the adapter-rendered `400`).
+    pub(crate) on_block: Option<OnBlockHook>,
+    /// The status-to-body overrides (for the adapter-rendered `400`).
+    pub(crate) custom_error_responses: crate::CustomErrorResponses,
 }
 
 impl GuardEngine {
@@ -120,94 +143,119 @@ impl GuardEngine {
         Self {
             body_cap: config.max_full_scan_bytes,
             config,
-            #[cfg(test)]
-            detect_fn: guard_core_engine::detect::detect,
+            scan_fn: guard_core_engine::detection_exclusions::scan_request,
             rate_limiter: None,
             ban_state: None,
+            detection_exclusions: None,
+            route_exclusions: None,
+            stage: None,
+            observability: None,
+            on_block: None,
+            custom_error_responses: crate::CustomErrorResponses::new(),
         }
     }
 
-    /// One engine call: the flagged view's threat categories, or `None` when
-    /// the engine clears the content. Regex threats carry the pattern
-    /// table's category; semantic threats carry their attack type.
-    fn categories_for(&self, content: &str, view: &str) -> Option<Vec<String>> {
-        #[cfg(test)]
-        let verdict = (self.detect_fn)(content, view, &self.config);
-        #[cfg(not(test))]
-        let verdict = guard_core_engine::detect::detect(content, view, &self.config);
-        if !verdict.is_threat {
-            return None;
-        }
-        Some(
-            verdict
-                .threats
-                .iter()
-                .map(|threat| match threat {
-                    Threat::Regex(regex) => regex.category.clone(),
-                    Threat::Semantic(semantic) => semantic.attack_type.clone(),
-                })
-                .collect(),
-        )
+    /// Resolve the per-request detection-exclusion surface: the global
+    /// config (the route-exclusion resolver supplies the per-route half)
+    /// merging through the engine's `resolve`.
+    fn resolved_exclusions(&self, request: &Request<'_>) -> ResolvedExclusions {
+        let route: Option<RouteDetectionExclusions> =
+            route_detection_exclusions(request).or_else(|| {
+                self.route_exclusions
+                    .as_ref()
+                    .and_then(|resolver| resolver(request.uri().path().as_str()))
+            });
+        resolve_exclusions(self.detection_exclusions.as_ref(), route.as_ref())
     }
 
-    /// Scan every metadata view, in the documented order: path, query,
-    /// headers. The first view the engine flags wins, and its categories are
-    /// the violation categories the auto-ban engine counts.
-    pub(crate) fn scan_metadata(&self, request: &Request<'_>) -> Option<Vec<String>> {
+    /// The reference multi-surface scan (`detection_exclusions::scan_request`)
+    /// over the metadata views: URL path, `parse_qsl`-decoded query
+    /// parameter pairs (per pair, so excluded names are skippable), and the
+    /// headers the adapter's framework-noise pre-filter leaves through. The
+    /// engine applies the reference exclusion semantics exactly: excluded
+    /// headers scan with their false-positive categories suppressed
+    /// (`ssrf` for address-chain values), the enabled-categories set filters
+    /// per value, and `detection_scan_body = false` affects the body
+    /// surface only.
+    fn scan_surfaces(&self, request: &Request<'_>, raw_body: Option<&[u8]>) -> RequestScanVerdict {
+        let resolved = self.resolved_exclusions(request);
+
         let path = request.uri().path().as_str();
-        if path != "/"
-            && let Some(categories) = self.categories_for(path, "url_path")
-        {
-            return Some(categories);
-        }
+        let url_path = if path == "/" { None } else { Some(path) };
 
-        if let Some(query) = request.uri().query() {
-            let query = query.as_str();
-            if !query.is_empty()
-                && let Some(categories) = self.categories_for(query, "query_param")
-            {
-                return Some(categories);
-            }
-        }
+        let query_params: Vec<(String, String)> = request
+            .uri()
+            .query()
+            .map_or("", |query| query.as_str())
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| match pair.split_once('=') {
+                Some((name, value)) => {
+                    (decode_query_component(name), decode_query_component(value))
+                }
+                None => (decode_query_component(pair), String::new()),
+            })
+            .collect();
 
-        for header in request.headers().iter() {
-            if is_excluded_header(header.name()) {
-                continue;
-            }
-            if let Some(categories) = self.categories_for(header.value(), "header") {
-                return Some(categories);
-            }
-        }
+        let headers: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .filter(|header| !is_excluded_header(header.name()))
+            .map(|header| (header.name().as_str().to_owned(), header.value().to_owned()))
+            .collect();
 
-        None
-    }
-
-    /// Scan the `request_body` view through the engine's body-value
-    /// extraction: the body is routed by content type (urlencoded fields,
-    /// multipart parts, JSON walks, blob fallback) and every extracted value
-    /// is scanned with the context the reference engine scans it under; the
-    /// first threat wins. A value with a forced category (a JSON mongo
-    /// operator key the reference reports straight from the JSON walk) is a
-    /// threat outright. An empty (or whitespace-only) body is not scanned,
-    /// mirroring the sibling adapters.
-    pub(crate) fn scan_body(&self, request: &Request<'_>, bytes: &[u8]) -> Option<Vec<String>> {
-        let text = String::from_utf8_lossy(bytes);
-        if text.trim().is_empty() {
-            return None;
-        }
         let content_type = request
             .headers()
             .get_one("content-type")
             .unwrap_or_default();
-        for value in extract_body_scan_values(&text, content_type, &self.config) {
-            if let Some(forced) = value.forced_category {
-                return Some(vec![forced.to_owned()]);
-            }
-            if let Some(categories) = self.categories_for(&value.content, &value.context) {
-                return Some(categories);
-            }
+        let raw_body = raw_body
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default();
+
+        let surfaces = RequestSurfaces {
+            url_path,
+            query_params: &query_params,
+            headers: &headers,
+            content_type,
+            raw_body: &raw_body,
+        };
+        (self.scan_entry())(&surfaces, &resolved, &self.config)
+    }
+
+    /// The scan entry point stored on the engine (test-only panic
+    /// injection); production builds always store the engine's
+    /// `detection_exclusions::scan_request`.
+    pub(crate) const fn scan_entry(
+        &self,
+    ) -> fn(&RequestSurfaces<'_>, &ResolvedExclusions, &DetectConfig) -> RequestScanVerdict {
+        self.scan_fn
+    }
+
+    /// Scan the metadata views (path, query, headers): the first flagged
+    /// view's verdict feeds the auto-ban engine, whose categories the
+    /// stage counts.
+    pub(crate) fn scan_metadata(&self, request: &Request<'_>) -> Option<RequestScanVerdict> {
+        let verdict = self.scan_surfaces(request, None);
+        verdict.is_threat.then_some(verdict)
+    }
+
+    /// Scan the `request_body` view through the engine's body-value
+    /// extraction: the body is routed by content type (urlencoded fields,
+    /// multipart parts, JSON walks, blob fallback) and every extracted
+    /// value is scanned under the context the reference engine scans it
+    /// under; excluded body fields skip, and `detection_scan_body = false`
+    /// skips the surface entirely.
+    pub(crate) fn scan_body(
+        &self,
+        request: &Request<'_>,
+        bytes: &[u8],
+    ) -> Option<RequestScanVerdict> {
+        let text = String::from_utf8_lossy(bytes);
+        if text.trim().is_empty() {
+            return None;
         }
-        None
+        let verdict = self.scan_surfaces(request, Some(bytes));
+        verdict.is_threat.then_some(verdict)
     }
 }
 
@@ -252,86 +300,255 @@ pub(crate) fn record_gate_decision(request: &Request<'_>, decision: IpGateDecisi
     request.local_cache(|| GateDecision(Some(decision)));
 }
 
-/// The client IP, when the request is attributable and not skipped by the
-/// `exempt_ips` contract: the stateful stage's gate.
-///
-/// Unattributed requests cannot be banned, rate limited, or counted (the
-/// stage cannot tell who to hold responsible); whitelisted and exempt IPs
-/// skip exactly what the reference skips for a whitelist match. Detection
-/// applies to both, always.
-fn attributed_and_counting(request: &Request<'_>) -> Option<IpAddr> {
-    let ip = request.client_ip()?;
-    let decision = gate_decision(request).unwrap_or_default();
-    if decision.is_whitelisted || decision.is_exempt {
-        return None;
+/// The request pieces the stage's event and log emissions read.
+pub(crate) fn request_observation(request: &Request<'_>) -> RequestObservation {
+    let mut url = request.uri().path().as_str().to_owned();
+    if let Some(query) = request.uri().query() {
+        url.push('?');
+        url.push_str(query.as_str());
     }
-    Some(ip)
+    RequestObservation {
+        method: Some(request.method().as_str().to_owned()),
+        url: Some(url),
+        user_agent: request.headers().get_one("user-agent").map(str::to_owned),
+    }
 }
 
-/// The stateful stage: dynamic bans, then rate limiting, in the reference
-/// pipeline's order (an IP ban check precedes the rate limiter).
-///
-/// Returns the verdict when the stage denies the request: [`Verdict::Banned`]
-/// for a live ban, [`Verdict::RateLimited`] with the `Retry-After` window for
-/// a crossing. Rate-limit autoban: every active crossing counts one
-/// `rate_limit` violation toward the auto-ban engine (the reference's
-/// `_record_rate_limit_autoban`); the response stays 429 and the ban bites on
-/// the next request, which the ban stage answers with 403.
-pub(crate) fn state_stage(engine: &GuardEngine, request: &Request<'_>) -> Option<Verdict> {
-    let ip = attributed_and_counting(request)?;
-
-    // Ban check first: a banned IP is denied before its rate window is
-    // touched, so banned traffic neither consumes budget nor counts
-    // violations (the request never reaches the limiter).
-    if let Some(ban) = &engine.ban_state
-        && ban.config.enable_ip_banning
-        && ban.manager.is_banned(ip)
-    {
-        return Some(Verdict::Banned);
+/// The reference block shapes mapped onto the request-local verdicts; the
+/// `custom_error_responses` body override, when one applied, rides along.
+pub(crate) fn verdict_from_stage(response: &StageResponse) -> (Verdict, Option<String>) {
+    let custom = response.custom_body.clone();
+    match (response.status.as_u16(), response.body) {
+        (403, crate::response::BANNED_MESSAGE) => (Verdict::Banned, custom),
+        (403, _) => (Verdict::ActivityBanned, custom),
+        (429, _) => (
+            Verdict::RateLimited(response.retry_after.unwrap_or(0)),
+            custom,
+        ),
+        (503, _) => (Verdict::RedisUnavailable, custom),
+        _ => (Verdict::Failed, custom),
     }
-
-    let limiter = engine.rate_limiter.as_ref()?;
-    let decision = limiter.check(ip, None);
-    if decision.allowed {
-        return None;
-    }
-    if limiter.config().enable_rate_limit_auto_ban
-        && let Some(ban) = &engine.ban_state
-    {
-        ban.register_violations(ip, &[RATE_LIMIT_CATEGORY], "rate_limit_exceeded");
-    }
-    Some(Verdict::RateLimited(decision.retry_after()))
 }
 
-/// The detection block for one flagged request, with the auto-ban engine
-/// attached: the flagged view's categories count as violations for the
-/// client IP, and a crossed threshold bans on the spot (the reference
-/// pipeline's suspicious-activity stage). Returns [`Verdict::ActivityBanned`]
-/// when the ban fired on this request, [`Verdict::Threat`] otherwise.
-pub(crate) fn detect_block(
+/// The stashed `custom_error_responses` body override, if the stage
+/// carried one for this request's refusal.
+pub(crate) fn block_body_override(request: &Request<'_>) -> Option<String> {
+    request
+        .local_cache(|| BlockBody(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("block body slot")
+        .clone()
+}
+
+/// Record the block-body override for the catchers to render.
+pub(crate) fn record_block_body(request: &Request<'_>, custom: Option<String>) {
+    if let Some(body) = custom {
+        *request
+            .local_cache(|| BlockBody(std::sync::Mutex::new(None)))
+            .0
+            .lock()
+            .expect("block body slot") = Some(body);
+    }
+}
+
+/// One engine-stage pass over the request (bans, then the rate-limit
+/// tiers, then the metadata finding): the fairing's `on_request` flow.
+/// Returns the verdict and the block-body override, or `None` for
+/// pass-through (including passive mode, where the finding below was still
+/// observed and counted by the stage).
+pub(crate) fn stage_decision(
     engine: &GuardEngine,
     request: &Request<'_>,
-    categories: &[String],
+    finding: Option<&RequestScanVerdict>,
+) -> Option<(Verdict, Option<String>)> {
+    let stage = engine.stage.as_ref()?;
+    let finding = finding.map(|verdict| guard_core_rs::tower::ThreatFinding {
+        is_threat: true,
+        categories: verdict.categories.clone(),
+        trigger_info: verdict.reason.clone(),
+    });
+    let tiers = route_rate_limits(request);
+    let decision = stage.decide_for_path_observed(
+        request.client_ip(),
+        Some(request.uri().path().as_str()),
+        tiers.as_ref(),
+        gate_decision(request),
+        finding.as_ref(),
+        Some(&request_observation(request)),
+    );
+    let decision = decision?;
+    let (verdict, custom) = verdict_from_stage(&decision);
+    record_block_body(request, custom);
+    Some((verdict, None))
+}
+
+/// The below-threshold detection block for a metadata finding: the plain
+/// `Threat` verdict (the `400` shape), suppressed under passive mode.
+pub(crate) fn metadata_threat_verdict(
+    engine: &GuardEngine,
+    request: &Request<'_>,
+    verdict: &RequestScanVerdict,
 ) -> Verdict {
-    // Counting is attribute-gated only: the engine's resolution refuses to
-    // ban while the config's enable_ip_banning is off, and the violations
-    // still count (enabling banning later starts from observed history).
-    if let (Some(ban), Some(ip)) = (engine.ban_state.as_ref(), attributed_and_counting(request)) {
-        let category_refs: Vec<&str> = categories.iter().map(String::as_str).collect();
-        if ban
-            .register_violations(ip, &category_refs, "penetration_attempt")
-            .is_some()
-        {
-            return Verdict::ActivityBanned;
-        }
+    let passive = engine
+        .stage
+        .as_ref()
+        .is_some_and(|stage| stage.config().passive_mode);
+    if passive {
+        return Verdict::Clean;
+    }
+    // The plain `400` block, with the `custom_error_responses` override and
+    // the reference `on_block` payload (the stage fired only for its own
+    // crossings; this block shape is the adapter's).
+    let body = guard_core_rs::responses::resolve_error_body(
+        &engine.custom_error_responses,
+        400,
+        crate::response::BLOCKED_MESSAGE,
+    );
+    record_block_body(request, Some(body));
+    if let Some(observability) = &engine.observability {
+        let ip = request
+            .client_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let observation = request_observation(request);
+        let payload = guard_core_rs::responses::build_block_payload(
+            "suspicious_activity",
+            &format!("Suspicious activity detected: {ip}"),
+            &verdict.reason,
+            false,
+            &ip,
+            observation.url.as_deref().unwrap_or("/"),
+            observation.method.as_deref().unwrap_or(""),
+            Some(400),
+            &observability.sensitive,
+        );
+        guard_core_rs::responses::fire_block_hook(engine.on_block.as_ref(), &payload);
     }
     Verdict::Threat
 }
 
-/// Deduplicate and sort the flagged view's categories: the deterministic
-/// order the auto-ban engine resolves thresholds in (the Go port sorts too).
-pub(crate) fn sort_categories(mut categories: Vec<String>) -> Vec<String> {
-    categories.sort_unstable();
-    categories.dedup();
-    categories
+/// The body finding, fed through the stage's split detection feed
+/// (`feed_finding`: no ban check, no rate-limit tier re-recording - the
+/// `on_request` pass already recorded the window once). A crossed
+/// threshold answers `ActivityBanned`, otherwise the plain `Threat` block
+/// shape; passive mode renders nothing.
+pub(crate) fn enforce_body_finding(
+    engine: &GuardEngine,
+    request: &Request<'_>,
+    verdict: &RequestScanVerdict,
+) -> Verdict {
+    let Some(stage) = engine.stage.as_ref() else {
+        return Verdict::Threat;
+    };
+    let finding = guard_core_rs::tower::ThreatFinding {
+        is_threat: true,
+        categories: verdict.categories.clone(),
+        trigger_info: verdict.reason.clone(),
+    };
+    let gate = gate_decision(request);
+    let whitelisted = gate.is_some_and(|gate| gate.is_whitelisted);
+    let crossed = stage.feed_finding(
+        request.client_ip(),
+        whitelisted,
+        Some(&finding),
+        Some(&request_observation(request)),
+    );
+    if let Some(answer) = crossed {
+        let (verdict, custom) = verdict_from_stage(&answer);
+        record_block_body(request, custom);
+        return verdict;
+    }
+    if stage.config().passive_mode {
+        Verdict::Clean
+    } else {
+        Verdict::Threat
+    }
+}
+
+/// Request-local slot for the per-route rate-limit tier override (the
+/// Rocket counterpart of the reference's `request.state.route_config`).
+/// Interior-mutable because Rocket's request-local cache hands out shared
+/// references.
+pub(crate) struct RouteTiers(pub(crate) std::sync::Mutex<Option<crate::RouteRateLimits>>);
+
+/// Request-local slot for the block-body override
+/// (`custom_error_responses`). Interior-mutable for the same reason.
+pub(crate) struct BlockBody(pub(crate) std::sync::Mutex<Option<String>>);
+
+/// Request-local slot for the per-route detection-exclusion override.
+pub(crate) struct RouteExclusions(pub(crate) std::sync::Mutex<Option<RouteDetectionExclusions>>);
+
+/// Read the route tier override, if a preceding fairing or guard set one.
+pub(crate) fn route_rate_limits(request: &Request<'_>) -> Option<crate::RouteRateLimits> {
+    request
+        .local_cache(|| RouteTiers(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route tiers slot")
+        .clone()
+}
+
+/// Set the per-route rate-limit tier override for this request (a
+/// preceding fairing or guard calls it before the request's security pass
+/// reads it).
+pub fn set_route_rate_limits(request: &Request<'_>, tiers: crate::RouteRateLimits) {
+    *request
+        .local_cache(|| RouteTiers(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route tiers slot") = Some(tiers);
+}
+
+/// Set the per-route detection-exclusion override for this request (a
+/// non-`None` route value replaces the global set for that surface; the
+/// header set always merges).
+pub fn set_route_detection_exclusions(request: &Request<'_>, exclusions: RouteDetectionExclusions) {
+    *request
+        .local_cache(|| RouteExclusions(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route exclusions slot") = Some(exclusions);
+}
+
+pub(crate) fn route_detection_exclusions(
+    request: &Request<'_>,
+) -> Option<RouteDetectionExclusions> {
+    request
+        .local_cache(|| RouteExclusions(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route exclusions slot")
+        .clone()
+}
+
+/// The per-route detection-exclusion resolver:
+/// `path -> Option<RouteDetectionExclusions>`.
+pub(crate) type RouteExclusionsResolver =
+    Arc<dyn Fn(&str) -> Option<RouteDetectionExclusions> + Send + Sync>;
+
+/// `urllib.parse.unquote_plus` for one query component: `%XX` runs and `+`
+/// (form-encoding's space) decode into the value the reference's
+/// `parse_qsl` hands the engine. Malformed escapes stay literal.
+fn decode_query_component(component: &str) -> String {
+    let plus_decoded = component.replace('+', " ");
+    let bytes = plus_decoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            )
+        {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

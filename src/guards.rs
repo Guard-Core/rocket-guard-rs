@@ -1,9 +1,7 @@
 //! The enforcement guards: `BlockGuard` for requests without a body,
 //! `GuardBody` for requests with one.
 
-use crate::scan::{
-    GuardEngine, Verdict, detect_block, metadata_verdict, record_enforced, sort_categories,
-};
+use crate::scan::{GuardEngine, Verdict, enforce_body_finding, metadata_verdict, record_enforced};
 use rocket::data::{Data, FromData, Outcome as DataOutcome, ToByteUnit};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
@@ -161,14 +159,16 @@ impl<'r> FromData<'r> for GuardBody {
             if metadata != Verdict::Clean {
                 return metadata;
             }
-            // The body view, with the auto-ban engine attached: the flagged
-            // categories count for the client IP (the reference pipeline's
-            // suspicious-activity stage), and a crossed threshold bans on
-            // the spot.
+            // The body view, fed through the stage's split detection feed
+            // (`feed_finding`): the flagged categories count for the client
+            // IP (the reference pipeline's suspicious-activity stage), a
+            // crossed threshold bans on the spot, and no rate-limit window
+            // records again - the fairing's `on_request` pass already
+            // recorded the request's single hit.
             engine
                 .scan_body(request, &bytes)
-                .map_or(Verdict::Clean, |categories| {
-                    detect_block(engine, request, sort_categories(categories).as_slice())
+                .map_or(Verdict::Clean, |verdict| {
+                    enforce_body_finding(engine, request, &verdict)
                 })
         }))
         .unwrap_or(Verdict::Failed);

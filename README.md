@@ -62,6 +62,21 @@ One engine call per request view, mirroring the mapping used by the sibling adap
 
 The HTTP method is not fed to the engine: the engine's `detect(content, context, config)` takes content plus a context, and the reference adapters do not scan the method either.
 
+## Engine surfaces (public config)
+
+Every stateful decision and emission runs through the engine facade's rate-limit stage, configured through `GuardFairing` builders:
+
+| Surface | Builder / idiom |
+|---|---|
+| Rate-limit tiers | `.with_route_tiers(resolver)` (`path -> Option<RouteRateLimits>`), `.with_geo_handler(handler)` (geo tiers); per-request override via `set_route_rate_limits(&request, tiers)` |
+| Detection exclusions | `.with_detection_exclusions(config)` (global `excluded_detection_headers/params/body_fields`, `enabled_detection_categories`, `detection_scan_body`), `.with_route_detection_exclusions(resolver)` (per route), or the `set_route_detection_exclusions(&request, exclusions)` request-local setter |
+| Events + log settings | `.with_event_bus(bus)` (`SecurityEventBus` hook registration), `.with_observability(config)` (`log_suspicious_level`, `muted_check_logs`, the `log_sensitive_headers/params/body_fields` redaction sets) |
+| `on_block` + custom errors | `.with_on_block(hook)`, `.with_custom_error_responses(map)` (status-to-body overrides on every block answer, including the `400` detection block, honored by the catchers and the `404` rewrite) |
+| Distributed mode | `.with_distributed_store(window_store, prefix, fail_open)` + `.with_distributed_ban_store(ban_store)` (fail-closed backend errors answer `503 Redis rate limiting unavailable`) |
+| Passive mode | `.with_passive_mode(true)` (windows and counters still record, log lines and events still fire, no block renders, auto-ban feeds suppressed) |
+
+Two-phase note (framework shape, reference-matching order): Rocket's `on_request` never sees the request body, so the fairing runs the full stage pass (bans, rate-limit tiers, the metadata finding) in `on_request` - recording the request's single rate-window hit there - and the body finding feeds later through the stage's split `feed_finding` seam, exactly how the reference pipeline orders rate limiting before body processing.
+
 ## Responses
 
 | Situation | Status | Body |
