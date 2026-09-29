@@ -98,3 +98,40 @@ jobs:
         run: cargo check --all-targets
       - name: cargo test
         run: cargo test
+
+  coverage:
+    name: coverage (100% lines)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Moving branch, same tradeoff as the stable job above: the engine is
+      # a local path dependency until it is tagged.
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
+      - name: Install the stable Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Enforce 100% line coverage
+        run: cargo llvm-cov --fail-under-lines 100

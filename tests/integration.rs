@@ -242,3 +242,245 @@ async fn concurrent_requests_are_screened_independently() {
         }
     }
 }
+
+#[tokio::test]
+async fn valueless_query_parameter_is_benign() {
+    // A query pair without `=` (`?flag`) is a name with an empty value; it
+    // must decode and scan like any other pair, not fall over.
+    let client = guarded_client().await;
+    let response = client.get("/api/items?flag").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(body_text(response).await, "GET /api/items");
+}
+
+#[tokio::test]
+async fn whitespace_only_body_passes_unscanned() {
+    let client = guarded_client().await;
+    let response = client.post("/echo").body("   \n\t").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(body_text(response).await, "   \n\t");
+}
+
+#[tokio::test]
+async fn metadata_threat_blocks_the_body_guard_before_the_scan() {
+    // The query already trips the metadata pass, so the `GuardBody` route
+    // refuses on the stashed verdict without even reading the (benign) body.
+    let client = guarded_client().await;
+    let response = client
+        .post("/echo?q=1+OR+1%3D1")
+        .body("perfectly innocent")
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
+}
+
+#[post("/reveal", data = "<body>")]
+#[allow(clippy::needless_pass_by_value)] // data guards take `Data` by value
+fn reveal(body: GuardBody) -> String {
+    format!(
+        "{} bytes: {}",
+        body.as_slice().len(),
+        String::from_utf8_lossy(&body.into_inner())
+    )
+}
+
+#[tokio::test]
+async fn guard_hands_the_scanned_bytes_to_the_handler() {
+    // Both byte accessors on the scanned body: `as_slice` before the move,
+    // `into_inner` after, with the bytes intact end to end.
+    let client = Client::tracked(
+        rocket::build()
+            .attach(GuardFairing::new(default_config()))
+            .mount("/", routes![reveal]),
+    )
+    .await
+    .expect("valid rocket");
+    let response = client.post("/reveal").body("hello").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(body_text(response).await, "5 bytes: hello");
+}
+
+// --- the catcher defaults: statuses the application raises itself ---
+
+#[get("/bad-request")]
+fn bad_request_route() -> Status {
+    Status::BadRequest
+}
+
+#[get("/forbidden")]
+fn forbidden_route() -> Status {
+    Status::Forbidden
+}
+
+#[get("/too-many-requests")]
+fn too_many_requests_route() -> Status {
+    Status::TooManyRequests
+}
+
+#[get("/service-unavailable")]
+fn service_unavailable_route() -> Status {
+    Status::ServiceUnavailable
+}
+
+#[get("/server-error")]
+fn server_error_route() -> Status {
+    Status::InternalServerError
+}
+
+#[tokio::test]
+async fn application_error_statuses_keep_the_minimal_default_bodies() {
+    // A `4xx`/`5xx` the application raises itself (clean request, no guard
+    // refusal) must not be dressed up as a guard verdict: the catchers fall
+    // back to the minimal default body per status.
+    let client = Client::tracked(
+        rocket::build()
+            .attach(GuardFairing::new(default_config()))
+            .mount(
+                "/",
+                routes![
+                    bad_request_route,
+                    forbidden_route,
+                    too_many_requests_route,
+                    service_unavailable_route,
+                    server_error_route,
+                ],
+            ),
+    )
+    .await
+    .expect("valid rocket");
+
+    let expectations: [(&str, Status, &str); 5] = [
+        ("/bad-request", Status::BadRequest, "400 Bad Request"),
+        ("/forbidden", Status::Forbidden, "403 Forbidden"),
+        (
+            "/too-many-requests",
+            Status::TooManyRequests,
+            "429 Too Many Requests",
+        ),
+        (
+            "/service-unavailable",
+            Status::ServiceUnavailable,
+            "503 Service Unavailable",
+        ),
+        (
+            "/server-error",
+            Status::InternalServerError,
+            "500 Internal Server Error",
+        ),
+    ];
+    for (path, status, body) in expectations {
+        let response = client.get(path).dispatch().await;
+        assert_eq!(response.status(), status, "{path}");
+        assert_eq!(body_text(response).await, body, "{path}");
+    }
+}
+
+// --- the request-local overrides, set by a preceding fairing ---
+
+/// A fairing attached before `GuardFairing` that pins a one-request tier on
+/// every route: the documented attach-order way to resolve the per-route
+/// rate limit ahead of the security pass.
+struct TierOverride;
+
+#[rocket::async_trait]
+impl rocket::fairing::Fairing for TierOverride {
+    fn info(&self) -> rocket::fairing::Info {
+        rocket::fairing::Info {
+            name: "TierOverride",
+            kind: rocket::fairing::Kind::Request,
+        }
+    }
+
+    async fn on_request(&self, request: &mut rocket::Request<'_>, _data: &mut rocket::Data<'_>) {
+        rocket_guard_rs::set_route_rate_limits(
+            request,
+            rocket_guard_rs::RouteRateLimits::new(Some(1), None, None).expect("valid tiers"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_local_route_tiers_limit_their_request() {
+    let fairing = GuardFairing::with_defaults().with_rate_limiting(
+        rocket_guard_rs::RateLimiter::new(rocket_guard_rs::RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1000,
+            rate_limit_window: 60,
+            ..rocket_guard_rs::RateLimitConfig::default()
+        })
+        .expect("valid config"),
+    );
+    let client = Client::tracked(
+        rocket::build()
+            .attach(TierOverride)
+            .attach(fairing)
+            .mount("/", routes![index]),
+    )
+    .await
+    .expect("valid rocket");
+    let response = client
+        .get("/")
+        .remote("192.0.2.91:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let response = client
+        .get("/")
+        .remote("192.0.2.91:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::TooManyRequests);
+    assert_eq!(
+        response.headers().get_one("Retry-After"),
+        Some("60"),
+        "the override tier's window decides"
+    );
+}
+
+/// A fairing attached before `GuardFairing` that excludes the `q` query
+/// parameter on every route: the documented attach-order way to resolve the
+/// per-route detection exclusions ahead of the scan.
+struct ExclusionsOverride;
+
+#[rocket::async_trait]
+impl rocket::fairing::Fairing for ExclusionsOverride {
+    fn info(&self) -> rocket::fairing::Info {
+        rocket::fairing::Info {
+            name: "ExclusionsOverride",
+            kind: rocket::fairing::Kind::Request,
+        }
+    }
+
+    async fn on_request(&self, request: &mut rocket::Request<'_>, _data: &mut rocket::Data<'_>) {
+        rocket_guard_rs::set_route_detection_exclusions(
+            request,
+            rocket_guard_rs::RouteDetectionExclusions {
+                excluded_detection_params: Some(vec!["q".to_owned()]),
+                ..rocket_guard_rs::RouteDetectionExclusions::default()
+            },
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_local_route_exclusions_skip_their_surface() {
+    let client = Client::tracked(
+        rocket::build()
+            .attach(ExclusionsOverride)
+            .attach(GuardFairing::new(default_config()))
+            .mount("/", routes![index]),
+    )
+    .await
+    .expect("valid rocket");
+    let response = client
+        .get("/?q=1+OR+1%3D1")
+        .remote("192.0.2.92:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "the route excludes the param"
+    );
+}

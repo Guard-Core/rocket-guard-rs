@@ -558,3 +558,93 @@ fn decode_query_component(component: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::{
+        ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE,
+        RATE_LIMITED_MESSAGE, REDIS_UNAVAILABLE_MESSAGE,
+    };
+    use guard_core_rs::tower::StageResponse;
+
+    #[test]
+    fn verdict_status_mapping_covers_every_shape() {
+        assert_eq!(Verdict::Clean.status(), Status::Ok);
+        assert_eq!(Verdict::Threat.status(), Status::BadRequest);
+        assert_eq!(Verdict::IpBlocked.status(), Status::Forbidden);
+        assert_eq!(Verdict::Banned.status(), Status::Forbidden);
+        assert_eq!(Verdict::ActivityBanned.status(), Status::Forbidden);
+        assert_eq!(Verdict::RateLimited(30).status(), Status::TooManyRequests);
+        assert_eq!(
+            Verdict::RedisUnavailable.status(),
+            Status::ServiceUnavailable
+        );
+        assert_eq!(Verdict::Failed.status(), Status::InternalServerError);
+    }
+
+    /// A stage answer with the given status and default body, as the stage
+    /// emits it (no custom override, no `Retry-After` unless asked).
+    fn stage_answer(status: http::StatusCode, body: &'static str) -> StageResponse {
+        StageResponse {
+            status,
+            body,
+            retry_after: None,
+            custom_body: None,
+        }
+    }
+
+    #[test]
+    fn verdict_from_stage_maps_every_family_answer() {
+        assert_eq!(
+            verdict_from_stage(&stage_answer(http::StatusCode::FORBIDDEN, BANNED_MESSAGE)),
+            (Verdict::Banned, None)
+        );
+        assert_eq!(
+            verdict_from_stage(&stage_answer(
+                http::StatusCode::FORBIDDEN,
+                ACTIVITY_BANNED_MESSAGE
+            )),
+            (Verdict::ActivityBanned, None)
+        );
+        assert_eq!(
+            verdict_from_stage(&stage_answer(
+                http::StatusCode::BAD_REQUEST,
+                BLOCKED_MESSAGE
+            )),
+            (Verdict::Threat, None)
+        );
+        let mut throttled = stage_answer(http::StatusCode::TOO_MANY_REQUESTS, RATE_LIMITED_MESSAGE);
+        throttled.retry_after = Some(30);
+        assert_eq!(
+            verdict_from_stage(&throttled),
+            (Verdict::RateLimited(30), None)
+        );
+        assert_eq!(
+            verdict_from_stage(&stage_answer(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                REDIS_UNAVAILABLE_MESSAGE
+            )),
+            (Verdict::RedisUnavailable, None)
+        );
+        // Anything outside the family shapes is treated as an internal
+        // failure (fail secure).
+        assert_eq!(
+            verdict_from_stage(&stage_answer(
+                http::StatusCode::IM_A_TEAPOT,
+                FAILURE_MESSAGE
+            )),
+            (Verdict::Failed, None)
+        );
+    }
+
+    #[test]
+    fn verdict_from_stage_carries_the_custom_body_override() {
+        let mut answer = stage_answer(http::StatusCode::BAD_REQUEST, BLOCKED_MESSAGE);
+        answer.custom_body = Some("blocked:custom".to_owned());
+        assert_eq!(
+            verdict_from_stage(&answer),
+            (Verdict::Threat, Some("blocked:custom".to_owned()))
+        );
+    }
+}

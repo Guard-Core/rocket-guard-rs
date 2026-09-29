@@ -146,8 +146,11 @@ fn rate_limited<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
 /// `503` catcher: the fail-closed Redis-unavailable body when the
 /// distributed backend refused the request, a minimal default otherwise.
 fn service_unavailable<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
-    let guard_caused = metadata_verdict(request) == Some(Verdict::RedisUnavailable)
-        || enforced_verdict(request) == Some(Verdict::RedisUnavailable);
+    // Both slots are read: the enforced slot mirrors the metadata one, and a
+    // guard refusal always records exactly one of the two.
+    let metadata_caused = metadata_verdict(request) == Some(Verdict::RedisUnavailable);
+    let enforced_caused = enforced_verdict(request) == Some(Verdict::RedisUnavailable);
+    let guard_caused = metadata_caused || enforced_caused;
     finish(
         status,
         if guard_caused {
@@ -275,5 +278,11 @@ mod tests {
         assert_eq!(response.headers().get_one("Retry-After"), Some("60"));
         let response = verdict_response_plain(Verdict::RedisUnavailable);
         assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = verdict_response_plain(Verdict::Failed);
+        assert_eq!(response.status(), Status::InternalServerError);
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("text/plain; charset=utf-8")
+        );
     }
 }
