@@ -146,8 +146,11 @@ fn rate_limited<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
 /// `503` catcher: the fail-closed Redis-unavailable body when the
 /// distributed backend refused the request, a minimal default otherwise.
 fn service_unavailable<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
-    let guard_caused = metadata_verdict(request) == Some(Verdict::RedisUnavailable)
-        || enforced_verdict(request) == Some(Verdict::RedisUnavailable);
+    // Both slots are read: the enforced slot mirrors the metadata one, and a
+    // guard refusal always records exactly one of the two.
+    let metadata_caused = metadata_verdict(request) == Some(Verdict::RedisUnavailable);
+    let enforced_caused = enforced_verdict(request) == Some(Verdict::RedisUnavailable);
+    let guard_caused = metadata_caused || enforced_caused;
     finish(
         status,
         if guard_caused {
@@ -259,6 +262,31 @@ fn plain_response(status: Status, message: &'static str) -> Response<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocket::get;
+
+    // An `Err(Status)` from a route is an error outcome: only then do the
+    // catchers fire, and none of these requests carry adapter state, so
+    // every catcher takes its default-body branch.
+    #[get("/400")]
+    fn r400() -> Result<(), Status> {
+        Err(Status::BadRequest)
+    }
+    #[get("/403")]
+    fn r403() -> Result<(), Status> {
+        Err(Status::Forbidden)
+    }
+    #[get("/429")]
+    fn r429() -> Result<(), Status> {
+        Err(Status::TooManyRequests)
+    }
+    #[get("/500")]
+    fn r500() -> Result<(), Status> {
+        Err(Status::InternalServerError)
+    }
+    #[get("/503")]
+    fn r503() -> Result<(), Status> {
+        Err(Status::ServiceUnavailable)
+    }
 
     #[test]
     fn verdict_response_covers_every_block_shape() {
@@ -275,5 +303,39 @@ mod tests {
         assert_eq!(response.headers().get_one("Retry-After"), Some("60"));
         let response = verdict_response_plain(Verdict::RedisUnavailable);
         assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = verdict_response_plain(Verdict::Failed);
+        assert_eq!(response.status(), Status::InternalServerError);
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    /// A catcher that fires without any adapter state on the request falls
+    /// back to the minimal default body: each status is produced by a plain
+    /// route (no guards, no stashed verdicts) so the unscoped path runs.
+    #[rocket::async_test]
+    async fn catchers_without_adapter_state_render_the_default_bodies() {
+        use rocket::local::asynchronous::Client;
+        use rocket::routes;
+
+        let app = rocket::build()
+            .mount("/", routes![r400, r403, r429, r500, r503])
+            .register("/", guard_catchers());
+        let client = Client::tracked(app).await.expect("client");
+
+        let cases = [
+            ("/400", (Status::BadRequest, DEFAULT_400)),
+            ("/403", (Status::Forbidden, DEFAULT_403)),
+            ("/429", (Status::TooManyRequests, DEFAULT_429)),
+            ("/500", (Status::InternalServerError, DEFAULT_500)),
+            ("/503", (Status::ServiceUnavailable, DEFAULT_503)),
+        ];
+        for (path, (status, body)) in cases {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), status);
+            let rendered = response.into_string().await.unwrap_or_default();
+            assert_eq!(rendered, body, "default body for {path}");
+        }
     }
 }

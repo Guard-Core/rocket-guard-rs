@@ -924,6 +924,7 @@ version = "1.2.0"
 dependencies = [
  "guard-core-engine",
  "guard-core-rs",
+ "http 1.5.0",
  "rocket",
  "tokio",
 ]

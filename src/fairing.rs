@@ -2,7 +2,8 @@
 
 use crate::response;
 use crate::scan::{
-    GuardEngine, Metadata, Verdict, metadata_threat_verdict, record_gate_decision, stage_decision,
+    GuardEngine, Metadata, Verdict, metadata_threat_verdict, metadata_verdict,
+    record_gate_decision, stage_decision,
 };
 use guard_core_engine::detection_exclusions::DetectionExclusionConfig;
 use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
@@ -567,7 +568,7 @@ impl Fairing for GuardFairing {
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
-        let verdict = request.local_cache(|| Metadata(None)).0;
+        let verdict = metadata_verdict(request);
         if response.status() == Status::NotFound
             && let Some(verdict) = verdict
             && !matches!(verdict, Verdict::Clean | Verdict::Failed)
@@ -664,6 +665,13 @@ mod tests {
             response.into_string().await.as_deref(),
             Some(FAILURE_MESSAGE)
         );
+    }
+
+    #[test]
+    fn debug_impl_renders_the_struct_name_and_body_cap() {
+        let rendered = format!("{:?}", GuardFairing::with_defaults());
+        assert!(rendered.starts_with("GuardFairing"), "{rendered}");
+        assert!(rendered.contains("body_cap: 262144"), "{rendered}");
     }
 
     // --- body-value extraction through the full stack ---
@@ -1471,6 +1479,9 @@ mod stateful_tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Ok, "the body does not scan");
+        // A benign request to the second mounted route passes too.
+        let response = client.get("/hello2").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
         let (status, _, _) = full_status(
             GuardFairing::with_defaults(),
             "/files/../../etc/passwd",
@@ -1645,5 +1656,219 @@ mod stateful_tests {
             body, "denied:custom",
             "the live-ban shape takes the override"
         );
+    }
+
+    #[tokio::test]
+    async fn distributed_ban_store_wires_into_the_stage() {
+        // The engine's `MemoryStore` speaks both halves of the distributed
+        // seam; installing it as the ban store too must launch and rate
+        // limit through the shared backend.
+        let store = Arc::new(guard_core_engine::distributed::MemoryStore::default());
+        let fairing = GuardFairing::with_defaults()
+            .with_rate_limiting(limiter(2, false))
+            .with_distributed_store(
+                Arc::clone(&store) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                true,
+            )
+            .with_distributed_ban_store(store as Arc<dyn BanStore>);
+        for _ in 0..2 {
+            let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.86").await;
+            assert_eq!(status, Status::Ok);
+        }
+        let (status, body, _) = full_status(fairing, "/hello", "192.0.2.86").await;
+        assert_eq!(status, Status::TooManyRequests);
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn body_finding_crosses_the_threshold_and_bans_on_the_spot() {
+        // The metadata pass is clean; the flagged BODY feeds the stage's
+        // split detection feed, whose crossed threshold answers the
+        // activity-ban shape through the `403` catcher.
+        let config = IpBanConfig::new(
+            true,
+            100,
+            3600,
+            [(
+                "xss",
+                ThreatBanEntry {
+                    threshold: 1,
+                    duration: 60,
+                },
+            )],
+        )
+        .expect("valid config");
+        let fairing = GuardFairing::with_defaults().with_ip_banning(IpBanManager::new(), config);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful, login, echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .post("/echo")
+            .remote(peer("192.0.2.87"))
+            .body("<script>alert(1)</script>")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(ACTIVITY_BANNED_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_mode_records_the_body_finding_but_never_blocks() {
+        let fairing = GuardFairing::with_defaults().with_passive_mode(true);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful, login, echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .post("/echo")
+            .remote(peer("192.0.2.88"))
+            .body("<script>alert(1)</script>")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "passive: no body block");
+    }
+
+    #[tokio::test]
+    async fn unattributed_detection_block_fires_the_on_block_payload() {
+        // No client IP: the stage's decision pass cannot attribute the
+        // request, so the adapter's own `metadata_threat_verdict` renders
+        // the block and fires the reference hook payload itself.
+        let (payloads, hook) = block_collector();
+        let fairing = GuardFairing::with_defaults()
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful, login]),
+        )
+        .await
+        .expect("valid rocket");
+        // No `.remote(...)`: the request carries no client IP.
+        let response = client.get("/files/../../etc/passwd").dispatch().await;
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(crate::BLOCKED_MESSAGE)
+        );
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        assert_eq!(payloads[0].check_name, "suspicious_activity");
+        assert_eq!(payloads[0].status_code, Some(400));
+        assert_eq!(payloads[0].client_ip, "", "unattributed: empty identity");
+        assert!(!payloads[0].passive_mode);
+    }
+
+    #[tokio::test]
+    async fn body_scan_panic_fails_secure_through_the_guard() {
+        // The metadata pass scans clean, the body pass explodes: the guard
+        // recovers the panic as the fail-secure `500` and the catcher
+        // renders the failure body from the enforced slot.
+        let fairing = GuardFairing::with_defaults().with_scan_fn(body_only_panic);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful, login, echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .post("/echo")
+            .remote(peer("192.0.2.89"))
+            .body("<script>alert(1)</script>")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::InternalServerError);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(crate::FAILURE_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn manually_managed_engine_enforces_the_body_without_a_stage() {
+        // A host that manages the engine itself (documented alternative to
+        // letting the fairing manage it): on_ignite leaves the managed
+        // engine alone, so there is no stateful stage - the metadata scan
+        // still blocks (the adapter's own verdict path) and the body
+        // finding still blocks through the guard.
+        let client = Client::tracked(
+            rocket::build()
+                .manage(GuardEngine::new(crate::default_config()))
+                .attach(GuardFairing::with_defaults())
+                .mount("/", routes![hello_stateful, login, echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .get("/hello?q=1+OR+1%3D1")
+            .remote(peer("192.0.2.90"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest, "metadata block");
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(crate::BLOCKED_MESSAGE)
+        );
+        let response = client
+            .post("/echo")
+            .remote(peer("192.0.2.90"))
+            .body("<script>alert(1)</script>")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest, "body block");
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(crate::BLOCKED_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn whitelisted_ip_still_gets_the_detection_block_and_payload() {
+        // A whitelisted IP skips the stateful stages but never detection:
+        // the stage's decision pass answers nothing (the feed skips a
+        // whitelisted IP), so the adapter renders the block itself and
+        // fires the hook payload with the resolved client identity.
+        let (payloads, hook) = block_collector();
+        let gate = IpGateConfig::new(["192.0.2.91"], NIL, NIL).expect("valid lists");
+        let fairing = GuardFairing::with_defaults()
+            .with_ip_gate(gate)
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook);
+        let (status, body, _) = attack_status(fairing, "192.0.2.91").await;
+        assert_eq!(status, Status::BadRequest, "detection never skips");
+        assert_eq!(body, crate::BLOCKED_MESSAGE);
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        assert_eq!(payloads[0].check_name, "suspicious_activity");
+        assert_eq!(payloads[0].client_ip, "192.0.2.91");
+        assert_eq!(payloads[0].status_code, Some(400));
+    }
+
+    /// A scan that delegates the metadata pass to the real engine and
+    /// explodes only on the body pass (the surfaces carry a non-empty raw
+    /// body exactly then).
+    fn body_only_panic(
+        surfaces: &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+        exclusions: &guard_core_engine::detection_exclusions::ResolvedExclusions,
+        config: &guard_core_engine::detect::DetectConfig,
+    ) -> guard_core_engine::detection_exclusions::RequestScanVerdict {
+        if surfaces.raw_body.is_empty() {
+            return guard_core_engine::detection_exclusions::scan_request(
+                surfaces, exclusions, config,
+            );
+        }
+        panic!("body scan exploded");
     }
 }

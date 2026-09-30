@@ -252,4 +252,16 @@ mod tests {
         let fairing = fairing.with_body_cap(1024);
         assert_eq!(fairing.engine_body_cap(), 1024);
     }
+
+    #[test]
+    fn ban_state_debug_renders_the_manager_and_config() {
+        let entries: Vec<(String, ThreatBanEntry)> = Vec::new();
+        let state = BanState {
+            manager: IpBanManager::new(),
+            counters: ViolationCounters::new(),
+            config: IpBanConfig::new(true, 10, 3600, entries).expect("valid config"),
+        };
+        let rendered = format!("{state:?}");
+        assert!(rendered.starts_with("BanState"), "{rendered}");
+    }
 }
