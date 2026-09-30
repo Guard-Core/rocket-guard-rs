@@ -45,7 +45,7 @@ jobs:
         run: mv core-checkout ../guard-core-rs
 
       - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
@@ -130,7 +130,7 @@ jobs:
         run: mv core-checkout ../guard-core-rs
 
       - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           rustflags: ""
 
