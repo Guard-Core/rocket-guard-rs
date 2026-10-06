@@ -36,9 +36,7 @@ jobs:
         with:
           # Merged as rennf93/guard-core-rs#22; tracks master.
           repository: rennf93/guard-core-rs
-          # TEMPORARY pin: the stage surface wired in this branch ships on
-          # feat/full-stage-parity; revert to master once guard-core-rs#78 merges.
-          ref: feat/full-stage-parity
+          ref: master
           path: core-checkout
           persist-credentials: false
 
