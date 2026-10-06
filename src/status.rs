@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn json_string_escapes_the_control_family() {
         assert_eq!(json_string("plain"), "\"plain\"");
-        assert_eq!(json_string("a\"b\\c\nd\te"), "\"a\\\"b\\\\c\\nd\\te\"");
+        assert_eq!(json_string("a\"b\\c\nd\r\te"), "\"a\\\"b\\\\c\\nd\\r\\te\"");
         assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
     }
 
