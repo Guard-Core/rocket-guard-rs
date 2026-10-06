@@ -143,9 +143,18 @@ A body larger than the cap is rejected with `413` rather than forwarded unscanne
 
 ## Engine dependency
 
-The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the engine and facade crates inside a sibling `guard-core-rs` checkout so local builds and CI compile them from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so 1.1.0 could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`rocket-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`.
+The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the engine and facade crates inside a sibling `guard-core-rs` checkout so local builds and CI compile them from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so 1.1.0 could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`rocket-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`.
 
-The engine crate is `guard-core-engine` rather than the `guard-core-rs` facade because the facade currently re-exports only `compiler`, `preprocessor`, and `semantic`; `detect` (the entry point this adapter uses) is not re-exported there yet.
+Both halves of the sibling checkout are used: `guard-core-engine` for the detection entry point and the engine-side stages, and the `guard-core-rs` facade for the stage layers (the `guard_core_rs::*` stage types the fairing installs).
+
+## Stage surface (the reference 17-check pipeline, wired)
+
+Every reference check the engine ships is installable on `GuardFairing`, and the fairing runs the installed set in the reference pipeline order: emergency mode, HTTPS enforcement, request logging, request size/content caps, required headers + authentication, referrer, custom validators, time windows, geo country blocking, cloud-provider blocking, user-agent filtering, bans, rate limiting, the custom-request check, and the response-side pass (behavioral return rules + security headers + CORS). The builder table lives in the crate docs, including the Rocket-specific seams (the ban arm before geo/cloud/user-agent, the tiers after, the HTTPS redirect rendered in `on_response` because Rocket catchers are `400`-`599` only).
+
+## Not wired on purpose
+
+- **WebSocket guard**: a `rocket_ws` route's upgrade handshake passes through the fairing like any request; frames after the upgrade are not intercepted. There is no per-frame guard surface.
+- **Status route**: no `add_status_route` equivalent ships (a gap tracked family-wide); expose engine state through your own route if you need it.
 
 ## Development
 

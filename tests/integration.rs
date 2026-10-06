@@ -328,6 +328,11 @@ fn server_error_route() -> Status {
     Status::InternalServerError
 }
 
+#[get("/unauthorized")]
+fn unauthorized_route() -> Status {
+    Status::Unauthorized
+}
+
 #[tokio::test]
 async fn application_error_statuses_keep_the_minimal_default_bodies() {
     // A `4xx`/`5xx` the application raises itself (clean request, no guard
@@ -344,13 +349,14 @@ async fn application_error_statuses_keep_the_minimal_default_bodies() {
                     too_many_requests_route,
                     service_unavailable_route,
                     server_error_route,
+                    unauthorized_route,
                 ],
             ),
     )
     .await
     .expect("valid rocket");
 
-    let expectations: [(&str, Status, &str); 5] = [
+    let expectations: [(&str, Status, &str); 6] = [
         ("/bad-request", Status::BadRequest, "400 Bad Request"),
         ("/forbidden", Status::Forbidden, "403 Forbidden"),
         (
@@ -368,6 +374,7 @@ async fn application_error_statuses_keep_the_minimal_default_bodies() {
             Status::InternalServerError,
             "500 Internal Server Error",
         ),
+        ("/unauthorized", Status::Unauthorized, "401 Unauthorized"),
     ];
     for (path, status, body) in expectations {
         let response = client.get(path).dispatch().await;
@@ -554,6 +561,11 @@ async fn emergency_mode_blocks_outside_the_whitelist() {
 async fn https_enforcement_redirects_plain_http() {
     let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
         .enforce_https(true)
+        // The route-scoped opt-out: a path that refuses https passes the
+        // enforcement stage untouched (the decide-None edge of an installed
+        // stage - the fairing always sees the plain-http scheme, so this is
+        // the one pass-through shape Rocket can produce).
+        .route_resolver(Arc::new(|path: &str| (path == "/public").then_some(false)))
         .build()
         .expect("valid");
     let client = Client::tracked(app(
@@ -572,6 +584,11 @@ async fn https_enforcement_redirects_plain_http() {
         response.headers().get_one("Location"),
         Some("https://guard.example/private?token=1")
     );
+
+    // The route-scoped opt-out path passes through untouched.
+    let response = client.get("/public").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(body_text(response).await, "GET /public");
 }
 
 #[tokio::test]
@@ -884,6 +901,60 @@ async fn response_processor_renders_security_headers_and_cors_on_every_response(
         response.headers().get_one("x-frame-options"),
         Some("SAMEORIGIN")
     );
+}
+
+#[tokio::test]
+async fn unrouted_stage_blocks_rewrite_the_404_with_the_verdict_shape() {
+    // A stage block on a path that matches no route leaves the verdict in
+    // the request metadata and a Rocket `404` in flight; the fairing's
+    // response pass rewrites the not-found shape into the verdict's own
+    // status and body (the route-inventory shield).
+
+    // The required-headers stage on an unrouted path: the HeadersBlocked
+    // and AuthRequired verdict shapes.
+    let stage = HeadersAuthStage::new(
+        None,
+        Arc::new(|path: &str| {
+            (path == "/private/secret").then(|| {
+                Arc::new(RouteGuard {
+                    rules: HeaderAuthRules {
+                        required_headers: vec![RequiredHeader {
+                            name: String::from("x-api-key"),
+                            expected: String::from(REQUIRED_SENTINEL),
+                        }],
+                        auth_required: Some(String::from("bearer")),
+                        ..HeaderAuthRules::default()
+                    },
+                    verifier: Some(Arc::new(|credential: &str| credential == "let-me-in")),
+                    api_key_verifier: None,
+                })
+            })
+        }),
+    );
+    let client = Client::tracked(minimal_app(
+        GuardFairing::new(default_config()).with_headers_auth(stage),
+    ))
+    .await
+    .expect("valid rocket");
+
+    // Missing the required header: the reference dynamic 400 shape (the
+    // stage's own reason line rides the rewrite).
+    let response = client.get("/private/secret").dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(
+        body_text(response).await,
+        "Missing required header: x-api-key"
+    );
+
+    // A wrong bearer credential: the fixed 401 authentication shape.
+    let response = client
+        .get("/private/secret")
+        .header(Header::new("x-api-key", "present"))
+        .header(Header::new("Authorization", "Bearer nope"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+    assert_eq!(body_text(response).await, "Authentication required");
 }
 
 #[tokio::test]

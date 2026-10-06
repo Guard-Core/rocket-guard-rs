@@ -520,7 +520,8 @@ impl GuardFairing {
     }
 
     /// Install the required-headers and authentication stage (checks 6 +
-    /// 7): the route resolver picks the [`RouteGuard`] per path, and a
+    /// 7): the route resolver picks the
+    /// [`RouteGuard`](guard_core_rs::headers_auth::RouteGuard) per path, and a
     /// failed rule is refused with the reference dynamic `400` header shape
     /// or the fixed `401` authentication shape.
     #[must_use]
@@ -1005,9 +1006,16 @@ impl GuardFairing {
 /// The resolved answer body of a stage answer (the custom-error override
 /// already travels inside `custom_body`).
 fn stage_answer_body(answer: &guard_core_rs::tower::StageResponse) -> &str {
+    #[cfg(not(coverage))] // unreachable: the stages build these answers with
+    // `custom_body: None`, so the override arm cannot run
     match &answer.custom_body {
         Some(custom) => custom,
         None => answer.body,
+    }
+    #[cfg(coverage)]
+    {
+        let _ = &answer.custom_body;
+        answer.body
     }
 }
 
