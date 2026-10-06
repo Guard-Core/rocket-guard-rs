@@ -141,4 +141,9 @@ jobs:
         run: cargo build -p guard-core-engine --bins
 
       - name: Enforce 100% line coverage
+        env:
+          # cargo-llvm-cov compiles into its own target directory, so the
+          # test binaries' sibling search cannot see the probe; the env
+          # override pins the default-target-dir copy built one step above.
+          GUARD_PATTERN_PROBE_BIN: target/debug/guard-pattern-probe
         run: cargo llvm-cov --fail-under-lines 100
