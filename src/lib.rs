@@ -137,6 +137,8 @@ mod guards;
 mod response;
 mod scan;
 
+pub mod status;
+
 pub use crate::fairing::GuardFairing;
 pub use crate::guards::{BlockGuard, GuardBody, GuardBodyError};
 pub use crate::response::{
