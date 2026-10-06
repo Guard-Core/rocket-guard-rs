@@ -10,7 +10,7 @@
 //! `entries`/`last_refreshed` keys the Python family serves have no engine
 //! surface here and are not invented. The geo-ip component is `null` when no
 //! handler is configured and `{"configured":true}` when one is: the engine
-//! exposes no geo health readout ([`GeoIpHandler`] is the lookup trait).
+//! exposes no geo health readout ([`guard_core_engine::geo::GeoIpHandler`] is the lookup trait).
 //!
 //! # Example
 //!
@@ -41,7 +41,7 @@ pub const DEFAULT_STATUS_PATH: &str = "/_guard/status";
 /// Build it with the handles the application already owns: the
 /// [`CloudIpTable`] the cloud-provider stage was built from (clones share
 /// the store, so the snapshot always answers from the live table), and
-/// whether a [`GeoIpHandler`] is configured. Put it in Rocket's managed
+/// whether a [`guard_core_engine::geo::GeoIpHandler`] is configured. Put it in Rocket's managed
 /// state (`.manage(...)`) so [`guard_status`] reads it.
 ///
 /// The payload is serialized by hand (the crate carries no JSON
