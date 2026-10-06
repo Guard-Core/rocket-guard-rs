@@ -141,6 +141,14 @@ let fairing = rocket_guard_rs::GuardFairing::with_defaults()
 
 A body larger than the cap is rejected with `413` rather than forwarded unscanned. Rocket's own `limits` continue to apply inside handlers; a limit violation raised by Rocket's guards (for example `Json`) is also a `413` error outcome and therefore also gets the plain-text `Payload too large` body.
 
+## Status route
+
+`status::GuardStatus` in managed state plus the `status::guard_status` route handler is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): `.manage(GuardStatus::new().with_cloud_table(table)).mount(status::DEFAULT_STATUS_PATH, routes![guard_status])` mounts `GET /_guard/status`, serving the cloud-provider readiness table (`{"ready":...}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with one). The Rust engine tracks cloud readiness only, so the `entries`/`last_refreshed` keys the Python family serves have no counterpart here; the payload is rendered per request from in-memory state with no dependency added.
+
+## WebSocket upgrades
+
+WebSocket upgrades are not guarded by this adapter: Rocket 0.5 has no stable WebSocket surface (no upgrade interception point in the fairing/request-guard model this adapter is built on, and no first-party WS support to hang one on). The guard exists where the framework exposes the upgrade: axum applications use [`axum-guard-rs`](https://github.com/rennf93/axum-guard-rs)'s `websocket::WebSocketGuard` and actix Web applications use `actix-guard-rs`'s `websocket::WebSocketGuard` (1008 policy / 1013 try-again-later close semantics, 403 pre-accept, the fastapi-guard `guard/websocket.py` sequence). Plain requests still pass through the fairing + guard split as always.
+
 ## Engine dependency
 
 The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the engine and facade crates inside a sibling `guard-core-rs` checkout so local builds and CI compile them from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so 1.1.0 could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`rocket-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs` and `actix-guard-rs`.
