@@ -58,6 +58,23 @@ pub(crate) enum Verdict {
     /// The distributed backend failed with `redis_fail_open = false`; the
     /// reference's fail-closed `503` shape.
     RedisUnavailable,
+    /// Check 2: the emergency-mode gate blocked (the `503` shape; the
+    /// resolved body rides the block-body slot).
+    EmergencyBlocked,
+    /// Checks 6 + 7: a required header failed (the dynamic `400` shape;
+    /// the resolved body rides the block-body slot).
+    HeadersBlocked,
+    /// Check 7: authentication failed (the fixed `401` shape).
+    AuthRequired,
+    /// Checks 8 / 9 / 10 / 12b / 13 / 14: a stage answered its family
+    /// `403` (the resolved body rides the block-body slot).
+    StageForbidden,
+    /// Check 17 (and a route validator's own response): the block status
+    /// the custom function carried.
+    CustomBlock(u16),
+    /// Check 3: the HTTPS-enforcement stage redirected (the `301` target
+    /// rides the redirect-target slot).
+    HttpsRedirect,
     /// The engine panicked; fail secure.
     Failed,
 }
@@ -67,10 +84,19 @@ impl Verdict {
     pub(crate) const fn status(self) -> Status {
         match self {
             Verdict::Clean => Status::Ok,
-            Verdict::Threat => Status::BadRequest,
-            Verdict::IpBlocked | Verdict::Banned | Verdict::ActivityBanned => Status::Forbidden,
+            Verdict::Threat | Verdict::HeadersBlocked => Status::BadRequest,
+            Verdict::IpBlocked
+            | Verdict::Banned
+            | Verdict::ActivityBanned
+            | Verdict::StageForbidden => Status::Forbidden,
             Verdict::RateLimited(_) => Status::TooManyRequests,
-            Verdict::RedisUnavailable => Status::ServiceUnavailable,
+            Verdict::RedisUnavailable | Verdict::EmergencyBlocked => Status::ServiceUnavailable,
+            Verdict::AuthRequired => Status::Unauthorized,
+            Verdict::CustomBlock(status) => match Status::from_code(status) {
+                Some(status) => status,
+                None => Status::InternalServerError,
+            },
+            Verdict::HttpsRedirect => Status::MovedPermanently,
             Verdict::Failed => Status::InternalServerError,
         }
     }
@@ -368,6 +394,9 @@ pub(crate) fn stage_decision(
     request: &Request<'_>,
     finding: Option<&RequestScanVerdict>,
 ) -> Option<(Verdict, Option<String>)> {
+    // The tiers + detection-feed half only: the ban arm ran earlier in the
+    // fairing's `on_request` pass, at the reference position (before the
+    // geo, cloud-provider, and user-agent checks).
     let stage = engine.stage.as_ref()?;
     let finding = finding.map(|verdict| guard_core_rs::tower::ThreatFinding {
         is_threat: true,
@@ -375,7 +404,7 @@ pub(crate) fn stage_decision(
         trigger_info: verdict.reason.clone(),
     });
     let tiers = route_rate_limits(request);
-    let decision = stage.decide_for_path_observed(
+    let decision = stage.decide_tiers_observed(
         request.client_ip(),
         Some(request.uri().path().as_str()),
         tiers.as_ref(),
@@ -387,6 +416,32 @@ pub(crate) fn stage_decision(
     let (verdict, custom) = verdict_from_stage(&decision);
     record_block_body(request, custom);
     Some((verdict, None))
+}
+
+/// The ban arm alone (the reference `ip_security` ban check): the fairing's
+/// first stage pass, before the geo, cloud-provider, and user-agent checks.
+pub(crate) fn bans_decision(engine: &GuardEngine, request: &Request<'_>) -> Option<Verdict> {
+    let stage = engine.stage.as_ref()?;
+    let decision =
+        stage.decide_bans_observed(request.client_ip(), Some(&request_observation(request)))?;
+    let (verdict, custom) = verdict_from_stage(&decision);
+    record_block_body(request, custom);
+    Some(verdict)
+}
+
+/// A stage block with its own status and resolved body (the required
+/// headers, referrer, validators, time-window, geo, cloud, user-agent, and
+/// custom-request checks): the body lands in the block-body slot the
+/// catchers and the `404` rewrite render.
+pub(crate) fn stage_block(request: &Request<'_>, status: u16, body: &str) -> Verdict {
+    record_block_body(request, Some(body.to_owned()));
+    match status {
+        400 => Verdict::HeadersBlocked,
+        401 => Verdict::AuthRequired,
+        403 => Verdict::StageForbidden,
+        503 => Verdict::EmergencyBlocked,
+        other => Verdict::CustomBlock(other),
+    }
 }
 
 /// The below-threshold detection block for a metadata finding: the plain
@@ -481,6 +536,29 @@ pub(crate) struct RouteTiers(pub(crate) std::sync::Mutex<Option<crate::RouteRate
 /// Request-local slot for the block-body override
 /// (`custom_error_responses`). Interior-mutable for the same reason.
 pub(crate) struct BlockBody(pub(crate) std::sync::Mutex<Option<String>>);
+
+/// Request-local slot for the HTTPS redirect target (check 3's
+/// scheme-upgraded URL). Interior-mutable for the same reason.
+pub(crate) struct RedirectTarget(pub(crate) std::sync::Mutex<Option<String>>);
+
+/// The redirect target the HTTPS-enforcement stage composed, if any.
+pub(crate) fn redirect_target(request: &Request<'_>) -> Option<String> {
+    request
+        .local_cache(|| RedirectTarget(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("redirect target slot")
+        .clone()
+}
+
+/// Record the HTTPS redirect target for the `on_response` rewrite.
+pub(crate) fn record_redirect_target(request: &Request<'_>, target: String) {
+    *request
+        .local_cache(|| RedirectTarget(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("redirect target slot") = Some(target);
+}
 
 /// Request-local slot for the per-route detection-exclusion override.
 pub(crate) struct RouteExclusions(pub(crate) std::sync::Mutex<Option<RouteDetectionExclusions>>);

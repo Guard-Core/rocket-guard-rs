@@ -46,6 +46,13 @@ pub const OVERSIZE_MESSAGE: &str = "Payload too large";
 /// response.
 pub const FAILURE_MESSAGE: &str = "Security check failed";
 
+/// Detail message carried by the required-headers/authentication stage's
+/// `401` response (the reference `AuthenticationCheck` default).
+pub const AUTHENTICATION_REQUIRED_MESSAGE: &str = "Authentication required";
+
+/// Detail message carried by the emergency-mode stage's `503` response.
+pub const EMERGENCY_MESSAGE: &str = "Service temporarily unavailable";
+
 /// Minimal default bodies for statuses a catcher receives without any
 /// adapter state on the request.
 ///
@@ -53,6 +60,7 @@ pub const FAILURE_MESSAGE: &str = "Security check failed";
 /// delegate to it; these keep the status (and content type) honest without
 /// trying to reproduce Rocket's templated pages.
 const DEFAULT_400: &str = "400 Bad Request";
+const DEFAULT_401: &str = "401 Unauthorized";
 const DEFAULT_403: &str = "403 Forbidden";
 const DEFAULT_429: &str = "429 Too Many Requests";
 const DEFAULT_500: &str = "500 Internal Server Error";
@@ -75,6 +83,7 @@ pub(crate) const REDIS_UNAVAILABLE_MESSAGE: &str = "Redis rate limiting unavaila
 pub fn guard_catchers() -> Vec<Catcher> {
     vec![
         Catcher::new(400, blocked),
+        Catcher::new(401, unauthorized),
         Catcher::new(403, forbidden),
         Catcher::new(413, oversize),
         Catcher::new(429, rate_limited),
@@ -107,6 +116,20 @@ fn blocked<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
     finish(status, message, None)
 }
 
+/// `401` catcher: the authentication-required body when the headers/auth
+/// stage refused this request, a minimal default otherwise.
+fn unauthorized<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
+    if let Some(body) = custom_body(request) {
+        return finish_owned(status, body, None);
+    }
+    let message = if refusal_verdict(request) == Some(Verdict::AuthRequired) {
+        AUTHENTICATION_REQUIRED_MESSAGE
+    } else {
+        DEFAULT_401
+    };
+    finish(status, message, None)
+}
+
 /// `403` catcher: the gate/ban body when a guard blocked this request, a
 /// minimal default otherwise.
 fn forbidden<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
@@ -117,6 +140,8 @@ fn forbidden<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
         Some(Verdict::IpBlocked) => FORBIDDEN_MESSAGE,
         Some(Verdict::Banned) => BANNED_MESSAGE,
         Some(Verdict::ActivityBanned) => ACTIVITY_BANNED_MESSAGE,
+        // A stage block's resolved body rides the block-body slot (read
+        // above); the plain family default is the fallback.
         _ => DEFAULT_403,
     };
     finish(status, message, None)
@@ -148,18 +173,20 @@ fn rate_limited<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
 fn service_unavailable<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
     // Both slots are read: the enforced slot mirrors the metadata one, and a
     // guard refusal always records exactly one of the two.
-    let metadata_caused = metadata_verdict(request) == Some(Verdict::RedisUnavailable);
-    let enforced_caused = enforced_verdict(request) == Some(Verdict::RedisUnavailable);
-    let guard_caused = metadata_caused || enforced_caused;
-    finish(
-        status,
-        if guard_caused {
-            REDIS_UNAVAILABLE_MESSAGE
-        } else {
-            DEFAULT_503
-        },
-        None,
-    )
+    let metadata = metadata_verdict(request);
+    let enforced = enforced_verdict(request);
+    let guard_caused =
+        metadata == Some(Verdict::RedisUnavailable) || enforced == Some(Verdict::RedisUnavailable);
+    let emergency =
+        metadata == Some(Verdict::EmergencyBlocked) || enforced == Some(Verdict::EmergencyBlocked);
+    let message = if guard_caused {
+        REDIS_UNAVAILABLE_MESSAGE
+    } else if emergency {
+        EMERGENCY_MESSAGE
+    } else {
+        DEFAULT_503
+    };
+    finish(status, message, None)
 }
 
 /// `500` catcher: the fail-secure body when a guard failed this request, a
@@ -232,7 +259,9 @@ pub(crate) fn verdict_response(request: &Request<'_>, verdict: Verdict) -> Respo
 pub(crate) fn verdict_response_plain(verdict: Verdict) -> Response<'static> {
     match verdict {
         Verdict::Threat => plain_response(Status::BadRequest, BLOCKED_MESSAGE),
-        Verdict::IpBlocked => plain_response(Status::Forbidden, FORBIDDEN_MESSAGE),
+        Verdict::IpBlocked | Verdict::StageForbidden => {
+            plain_response(Status::Forbidden, FORBIDDEN_MESSAGE)
+        }
         Verdict::Banned => plain_response(Status::Forbidden, BANNED_MESSAGE),
         Verdict::ActivityBanned => plain_response(Status::Forbidden, ACTIVITY_BANNED_MESSAGE),
         Verdict::RateLimited(retry_after) => {
@@ -244,6 +273,16 @@ pub(crate) fn verdict_response_plain(verdict: Verdict) -> Response<'static> {
             Status::ServiceUnavailable,
             "Redis rate limiting unavailable",
         ),
+        Verdict::EmergencyBlocked => plain_response(Status::ServiceUnavailable, EMERGENCY_MESSAGE),
+        Verdict::HeadersBlocked => plain_response(Status::BadRequest, DEFAULT_400),
+        Verdict::AuthRequired => {
+            plain_response(Status::Unauthorized, AUTHENTICATION_REQUIRED_MESSAGE)
+        }
+        Verdict::CustomBlock(status) => plain_response(
+            Status::from_code(status).unwrap_or(Status::InternalServerError),
+            DEFAULT_403,
+        ),
+        Verdict::HttpsRedirect => plain_response(Status::MovedPermanently, ""),
         Verdict::Clean | Verdict::Failed => {
             plain_response(Status::InternalServerError, FAILURE_MESSAGE)
         }

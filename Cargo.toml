@@ -31,6 +31,7 @@ guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3
 rocket = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
+chrono = "0.4"
 # The stage answers (`guard_core_rs::tower::StageResponse`) carry an
 # `http::StatusCode`; the adapter tests compose them directly.
 http = "1.3"

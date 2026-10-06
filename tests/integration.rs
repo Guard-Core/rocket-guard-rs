@@ -11,7 +11,7 @@ use rocket::routes;
 use rocket_guard_rs::{BLOCKED_MESSAGE, BlockGuard, GuardBody, OVERSIZE_MESSAGE};
 use rocket_guard_rs::{GuardFairing, default_config};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 async fn body_text(response: LocalResponse<'_>) -> String {
     response.into_string().await.unwrap_or_default()
@@ -483,4 +483,421 @@ async fn request_local_route_exclusions_skip_their_surface() {
         Status::Ok,
         "the route excludes the param"
     );
+}
+
+// The newly wired stage surface (the reference 17-check pipeline): every
+// test below installs one stage on the fairing and proves its end-to-end
+// shape through the real Rocket stack (fairing + guards + catchers).
+
+use guard_core_engine::behavior::BehaviorTracker;
+use guard_core_engine::cors::CorsConfig;
+use guard_core_engine::custom_checks::{
+    CustomRequestContext, CustomResponse, CustomValidatorFn, ValidatorAnswer,
+};
+use guard_core_engine::geo::{GeoIpHandler, parse_country_lists};
+use guard_core_engine::headers_auth::{HeaderAuthRules, REQUIRED_SENTINEL, RequiredHeader};
+use guard_core_engine::ip_ban::IpBanManager;
+use guard_core_engine::security_headers::SecurityHeadersConfig;
+use guard_core_rs::cloud_provider::{
+    CloudIpTable, CloudProviderStage, CloudProviderStageConfig, parse_cloud_selectors,
+};
+use guard_core_rs::custom_checks::CustomChecksStage;
+use guard_core_rs::emergency_mode::EmergencyModeStage;
+use guard_core_rs::geo::{GeoStage, GeoStageConfig};
+use guard_core_rs::headers_auth::{HeadersAuthStage, RouteGuard};
+use guard_core_rs::https_enforcement::{HttpsEnforcementStage, HttpsEnforcementStageConfig};
+use guard_core_rs::process_response::ResponseProcessor;
+use guard_core_rs::route_gates::{GateConfig, ReferrerStage, TimeWindowStage};
+use guard_core_rs::user_agent::{UserAgentFilter, UserAgentStage, UserAgentStageConfig};
+
+struct UnitedStates;
+
+impl GeoIpHandler for UnitedStates {
+    fn get_country(&self, ip: std::net::IpAddr) -> Option<String> {
+        (ip.to_string() == "192.0.2.9").then(|| String::from("US"))
+    }
+}
+
+#[tokio::test]
+async fn emergency_mode_blocks_outside_the_whitelist() {
+    let stage = EmergencyModeStage::builder(
+        guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+    )
+    .emergency_mode(true)
+    .emergency_whitelist(["203.0.113.9"])
+    .build()
+    .expect("valid whitelist");
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_emergency_mode(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client
+        .get("/api/items")
+        .remote("198.51.100.1:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::ServiceUnavailable);
+    assert_eq!(body_text(response).await, "Service temporarily unavailable");
+
+    let response = client
+        .get("/api/items")
+        .remote("203.0.113.9:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(body_text(response).await, "GET /api/items");
+}
+
+#[tokio::test]
+async fn https_enforcement_redirects_plain_http() {
+    let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_https_enforcement(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client
+        .get("/private?token=1")
+        .header(Header::new("Host", "guard.example"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::MovedPermanently);
+    assert_eq!(
+        response.headers().get_one("Location"),
+        Some("https://guard.example/private?token=1")
+    );
+}
+
+#[tokio::test]
+async fn required_headers_and_authentication_answer_the_reference_shapes() {
+    let stage = HeadersAuthStage::new(
+        None,
+        Arc::new(|path: &str| {
+            (path == "/private").then(|| {
+                Arc::new(RouteGuard {
+                    rules: HeaderAuthRules {
+                        required_headers: vec![RequiredHeader {
+                            name: String::from("x-api-key"),
+                            expected: String::from(REQUIRED_SENTINEL),
+                        }],
+                        auth_required: Some(String::from("bearer")),
+                        ..HeaderAuthRules::default()
+                    },
+                    verifier: Some(Arc::new(|credential: &str| credential == "let-me-in")),
+                    api_key_verifier: None,
+                })
+            })
+        }),
+    );
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_headers_auth(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    // The required header is missing: the reference dynamic `400` shape.
+    let response = client.get("/private").dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest);
+
+    // The header is present but the bearer credential is wrong: `401`.
+    let response = client
+        .get("/private")
+        .header(Header::new("x-api-key", "present"))
+        .header(Header::new("Authorization", "Bearer nope"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+    assert_eq!(body_text(response).await, "Authentication required");
+
+    // Both rules pass: the handler runs.
+    let response = client
+        .get("/private")
+        .header(Header::new("x-api-key", "present"))
+        .header(Header::new("Authorization", "Bearer let-me-in"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn referrer_gate_blocks_a_missing_or_foreign_referrer() {
+    let stage = ReferrerStage::builder(GateConfig::default())
+        .resolver(Arc::new(|path: &str| {
+            (path == "/gated").then(|| vec![String::from("https://good.example")])
+        }))
+        .build();
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_referrer_gate(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client.get("/gated").dispatch().await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "Referrer required");
+
+    let response = client
+        .get("/gated")
+        .header(Header::new("Referer", "https://good.example/page"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    let response = client
+        .get("/gated")
+        .header(Header::new("Referer", "https://evil.example/page"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "Invalid referrer");
+}
+
+#[tokio::test]
+async fn custom_validators_block_with_the_validator_response() {
+    let stage = CustomChecksStage::builder()
+        .validators_resolver(Arc::new(|path: &str| {
+            (path == "/private").then(|| {
+                vec![(
+                    String::from("post_only"),
+                    Arc::new(|ctx: &CustomRequestContext<'_>| {
+                        (ctx.method != "POST").then_some(ValidatorAnswer::Response(
+                            CustomResponse { status: Some(403) },
+                        ))
+                    }) as CustomValidatorFn,
+                )]
+            })
+        }))
+        .build();
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_custom_checks(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client.get("/private").dispatch().await;
+    assert_eq!(response.status(), Status::Forbidden);
+
+    let response = client.post("/echo").body("{}").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn time_window_gate_blocks_outside_the_window() {
+    // The window is computed from the live clock so the test is
+    // deterministic: the gate closes for everything except a two-minute
+    // band that starts two minutes from now.
+    let now = chrono::Utc::now();
+    let start = (now + chrono::Duration::minutes(2))
+        .format("%H:%M")
+        .to_string();
+    let end = (now + chrono::Duration::minutes(3))
+        .format("%H:%M")
+        .to_string();
+    let stage = TimeWindowStage::builder(GateConfig::default())
+        .resolver(Arc::new(move |path: &str| {
+            (path == "/nightly").then(|| guard_core_engine::time_window::TimeWindow {
+                start: Some(start.clone()),
+                end: Some(end.clone()),
+                timezone: Some(String::from("UTC")),
+            })
+        }))
+        .build();
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_time_window_gate(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client.get("/nightly").dispatch().await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "Access not allowed at this time");
+
+    let response = client.get("/open").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn cloud_provider_blocking_answers_the_reference_403() {
+    let table = CloudIpTable::default();
+    table
+        .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+        .expect("valid ranges");
+    let stage = CloudProviderStage::new(CloudProviderStageConfig {
+        block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+        table,
+        passive_mode: false,
+    });
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_cloud_provider(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client
+        .get("/api")
+        .remote("192.0.2.9:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "Cloud provider IP not allowed");
+
+    let response = client
+        .get("/api")
+        .remote("198.51.100.9:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn geo_country_blocking_answers_the_reference_403() {
+    let stage = GeoStage::new(GeoStageConfig {
+        gate: parse_country_lists(Vec::<String>::new(), ["US"]),
+        handler: Some(Arc::new(UnitedStates)),
+        passive_mode: false,
+    });
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_geo_blocking(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client
+        .get("/api")
+        .remote("192.0.2.9:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "Forbidden");
+
+    let response = client
+        .get("/api")
+        .remote("198.51.100.9:1000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn user_agent_blocking_answers_the_reference_403() {
+    let stage = UserAgentStage::new(UserAgentStageConfig {
+        blocked_user_agents: UserAgentFilter::new(["bad-bot"]).expect("valid patterns"),
+        ..UserAgentStageConfig::default()
+    })
+    .expect("valid config");
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_user_agent(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client
+        .get("/api")
+        .header(Header::new("User-Agent", "bad-bot/1.0"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "User-Agent not allowed");
+
+    let response = client
+        .get("/api")
+        .header(Header::new("User-Agent", "friendly-crawler/2.0"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn custom_request_blocks_with_the_function_response() {
+    let stage = CustomChecksStage::builder()
+        .custom_request(
+            "maintenance_gate",
+            Arc::new(|ctx: &CustomRequestContext<'_>| {
+                (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+            }),
+        )
+        .build();
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_custom_checks(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client.get("/admin").dispatch().await;
+    assert_eq!(response.status(), Status::ServiceUnavailable);
+
+    let response = client.get("/public").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn response_processor_renders_security_headers_and_cors_on_every_response() {
+    let processor = ResponseProcessor::new(
+        Some(SecurityHeadersConfig::reference_default()),
+        Some(CorsConfig {
+            enabled: true,
+            allow_origins: vec![String::from("https://app.example.com")],
+            ..CorsConfig::default()
+        }),
+        Vec::new(),
+        Arc::new(Mutex::new(BehaviorTracker::new())),
+        IpBanManager::new(),
+        true,
+        262_144,
+        false,
+    );
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_response_processor(processor)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client
+        .get("/api")
+        .header(Header::new("Origin", "https://app.example.com"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(
+        response.headers().get_one("x-content-type-options"),
+        Some("nosniff")
+    );
+    assert_eq!(
+        response.headers().get_one("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+
+    // Block answers carry the set too (headers on blocked + passthrough).
+    let response = client
+        .post("/echo")
+        .body("<script>alert(1)</script>")
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(
+        response.headers().get_one("x-frame-options"),
+        Some("SAMEORIGIN")
+    );
+}
+
+#[tokio::test]
+async fn request_logging_composes_without_blocking() {
+    let stage = guard_core_rs::request_logging::RequestLoggingStage::new(
+        guard_core_rs::request_logging::RequestLoggingStageConfig::default(),
+    );
+    let client = Client::tracked(app(
+        GuardFairing::new(default_config()).with_request_logging(stage)
+    ))
+    .await
+    .expect("valid rocket");
+
+    let response = client.get("/api/items?limit=5").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(body_text(response).await, "GET /api/items");
 }
