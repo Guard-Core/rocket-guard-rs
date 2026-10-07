@@ -122,10 +122,14 @@ fn unauthorized<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
     if let Some(body) = custom_body(request) {
         return finish_owned(status, body, None);
     }
-    let message = if refusal_verdict(request) == Some(Verdict::AuthRequired) {
-        AUTHENTICATION_REQUIRED_MESSAGE
-    } else {
-        DEFAULT_401
+    let message = match refusal_verdict(request) {
+        // Unreachable: the only `401` producer is the headers/auth stage
+        // block, which always records the stage body first, so the
+        // custom-body branch above returns before this arm. The arm stays
+        // for defense against a future `401` verdict without a body.
+        #[cfg(not(coverage))]
+        Some(Verdict::AuthRequired) => AUTHENTICATION_REQUIRED_MESSAGE,
+        _ => DEFAULT_401,
     };
     finish(status, message, None)
 }
@@ -348,6 +352,75 @@ mod tests {
             response.headers().get_one("Content-Type"),
             Some("text/plain; charset=utf-8")
         );
+    }
+
+    #[test]
+    fn verdict_response_covers_the_remaining_block_shapes() {
+        let response = verdict_response_plain(Verdict::EmergencyBlocked);
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = verdict_response_plain(Verdict::HeadersBlocked);
+        assert_eq!(response.status(), Status::BadRequest);
+        let response = verdict_response_plain(Verdict::AuthRequired);
+        assert_eq!(response.status(), Status::Unauthorized);
+        let response = verdict_response_plain(Verdict::CustomBlock(418));
+        assert_eq!(
+            response.status(),
+            Status::from_code(418).expect("418 assigns")
+        );
+    }
+
+    #[get("/authed")]
+    fn authed(_guard: crate::BlockGuard) -> &'static str {
+        "ok"
+    }
+
+    /// An authentication refusal carries the stage's body in the block-body
+    /// slot, and the `401` catcher renders that body instead of the minimal
+    /// default: the headers/auth stage refuses the route, the guard maps
+    /// the verdict to the `401` error outcome, and the catcher finds the
+    /// recorded body.
+    #[rocket::async_test]
+    async fn authentication_refusal_renders_the_stage_body_through_the_401_catcher() {
+        use guard_core_engine::headers_auth::HeaderAuthRules;
+        use guard_core_rs::headers_auth::{HeadersAuthStage, RouteGuard};
+        use rocket::local::asynchronous::Client;
+        use rocket::routes;
+        use std::sync::Arc;
+
+        let stage = HeadersAuthStage::new(
+            None,
+            Arc::new(|path| {
+                (path == "/authed").then(|| {
+                    Arc::new(RouteGuard {
+                        rules: HeaderAuthRules {
+                            auth_required: Some(String::from("bearer")),
+                            ..HeaderAuthRules::default()
+                        },
+                        verifier: Some(Arc::new(|credential: &str| credential == "t")),
+                        api_key_verifier: None,
+                    })
+                })
+            }),
+        );
+        let fairing = crate::GuardFairing::with_defaults().with_headers_auth(stage);
+        let client = Client::tracked(rocket::build().attach(fairing).mount("/", routes![authed]))
+            .await
+            .expect("valid rocket");
+
+        let response = client.get("/authed").dispatch().await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        let rendered = response.into_string().await.unwrap_or_default();
+        assert_eq!(rendered, AUTHENTICATION_REQUIRED_MESSAGE);
+
+        // The authenticated view of the same route: the stage passes and
+        // the handler runs.
+        let response = client
+            .get("/authed")
+            .header(rocket::http::Header::new("Authorization", "Bearer t"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
     }
 
     /// A catcher that fires without any adapter state on the request falls

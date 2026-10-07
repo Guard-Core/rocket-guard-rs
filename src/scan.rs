@@ -661,6 +661,20 @@ mod tests {
         assert_eq!(Verdict::Failed.status(), Status::InternalServerError);
     }
 
+    #[test]
+    fn custom_block_status_mapping_covers_both_from_code_arms() {
+        // A stage answering its own status resolves through
+        // `Status::from_code`; an unassignable code falls to the `500`.
+        assert_eq!(
+            Verdict::CustomBlock(418).status(),
+            Status::from_code(418).expect("418 assigns")
+        );
+        assert_eq!(
+            Verdict::CustomBlock(60000).status(),
+            Status::InternalServerError
+        );
+    }
+
     /// A stage answer with the given status and default body, as the stage
     /// emits it (no custom override, no `Retry-After` unless asked).
     fn stage_answer(status: http::StatusCode, body: &'static str) -> StageResponse {

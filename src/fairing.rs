@@ -760,9 +760,7 @@ impl Fairing for GuardFairing {
             let request_bits = RequestBits {
                 method: request.method().as_str().to_owned(),
                 url_path: request.uri().path().as_str().to_owned(),
-                client_ip: request
-                    .client_ip()
-                    .map_or_else(String::new, |addr| addr.to_string()),
+                client_ip: client_ip_string(request.client_ip()),
                 origin: request.headers().get_one("origin").map(str::to_owned),
             };
             let _action =
@@ -772,6 +770,14 @@ impl Fairing for GuardFairing {
             }
         }
     }
+}
+
+/// The `RequestBits.client_ip` mapping: the connection's IP when it carries
+/// one, the empty string otherwise (a request served over a unix-socket
+/// listener has no remote IP, and the engine's `RequestBits` wants a plain
+/// `String`).
+fn client_ip_string(client_ip: Option<std::net::IpAddr>) -> String {
+    client_ip.map_or_else(String::new, |addr| addr.to_string())
 }
 
 impl GuardFairing {
@@ -1056,6 +1062,102 @@ mod tests {
         assert_eq!(
             response.into_string().await.as_deref(),
             Some(FAILURE_MESSAGE)
+        );
+    }
+
+    #[get("/validated")]
+    fn validated(_guard: BlockGuard) -> &'static str {
+        "ok"
+    }
+
+    #[test]
+    fn client_ip_string_maps_both_connection_kinds() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert_eq!(
+            client_ip_string(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))),
+            "203.0.113.7"
+        );
+        assert_eq!(client_ip_string(None), "");
+    }
+
+    /// A custom validator blocking with its own status rides the
+    /// `CustomBlock` verdict end to end: the validator answers `418` on the
+    /// `POST` view, the `other` stage-block arm maps it, and the guard's
+    /// error outcome carries the validator's own status; the `GET` view of
+    /// the same route passes and the handler runs.
+    #[tokio::test]
+    async fn custom_validator_block_answers_the_validator_status() {
+        use guard_core_engine::custom_checks::{
+            CustomRequestContext, CustomResponse, ValidatorAnswer,
+        };
+        use guard_core_rs::custom_checks::RouteValidatorFn;
+        use std::sync::Arc;
+
+        let validator: RouteValidatorFn = Arc::new(|ctx: &CustomRequestContext<'_>| {
+            (ctx.method == "POST").then_some(ValidatorAnswer::Response(CustomResponse {
+                status: Some(418),
+            }))
+        });
+        let stage = CustomChecksStage::builder()
+            .validators_resolver(Arc::new(move |path| {
+                (path == "/validated")
+                    .then(|| vec![(String::from("i_am_a_teapot"), Arc::clone(&validator))])
+            }))
+            .build();
+        let fairing = GuardFairing::with_defaults().with_custom_checks(stage);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![validated]),
+        )
+        .await
+        .expect("valid rocket");
+
+        let response = client.post("/validated").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::from_code(418).expect("418 assigns")
+        );
+        let response = client.get("/validated").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
+    }
+
+    /// The response-side processor pass renders the security headers (and
+    /// the CORS verdict) on every response the fairing touches, including
+    /// the plain bodyless ones `on_response` rewrites.
+    #[tokio::test]
+    async fn the_response_processor_renders_security_headers_on_every_response() {
+        use guard_core_engine::behavior::BehaviorTracker;
+        use guard_core_engine::ip_ban::IpBanManager;
+        use guard_core_engine::security_headers::SecurityHeadersConfig;
+        use guard_core_rs::process_response::ResponseProcessor;
+        use std::sync::{Arc, Mutex};
+
+        let processor = ResponseProcessor::new(
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            Vec::new(),
+            Arc::new(Mutex::new(BehaviorTracker::new())),
+            IpBanManager::new(),
+            false,
+            262_144,
+            false,
+        );
+        let fairing = GuardFairing::with_defaults().with_response_processor(processor);
+        let client = Client::tracked(rocket::build().attach(fairing).mount("/", routes![hello]))
+            .await
+            .expect("valid rocket");
+
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.headers().get_one("x-frame-options"),
+            Some("SAMEORIGIN")
         );
     }
 
