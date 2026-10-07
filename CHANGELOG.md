@@ -18,7 +18,13 @@ The reference-surface release: the status route lands in managed state, training
 
 ## [Unreleased]
 
+### Added
+
+- The unified-config consumption (`GuardFairing::from_security_config`, the GAP-R1 rocket leg): the 129-field `SecurityConfig` (the fieldized reference surface in guard-core-engine) builds the wired pipeline in one call - the detection budgets onto `DetectConfig`, the IP lists onto the gate, the rate-limit knobs onto the limiter, the ban group onto `IpBanManager` + `IpBanConfig`, `enforce_https`/`trust_x_forwarded_proto` onto the HTTPS stage, `emergency_mode` + its whitelist onto the emergency stage, `custom_error_responses`/`on_block` onto the response surface, the detection-exclusion group (with the reference's empty-set-disables-all-categories semantics) onto the scan, the observability group onto the log/redaction knobs, ReDoS-validated `blocked_user_agents`, and the security-headers/CORS/behavior response pass; invalid values fail closed through the new typed `GuardConfigError`; the reference `exclude_paths` carve-out lands as a first-class builder consumed first in the pipeline (an excluded path bypasses every request-side check, gate included, the response pass still renders); `SecurityConfig`, `SecurityConfigError`, `GuardConfigError`, and the `LogLevel`/`LogFormat`/`BufferOverflowPolicy` knob enums re-exported
+
 ### Changed
+
+- The IP-gate denial path now renders the reference ip_filter behavior end to end: passive mode logs the crossing and forwards (no verdict stashed, no gate decision downstream), the `on_block` hook fires once with the reference payload keys (`ip_security`), and the custom-error body override wins over the family default - previously the gate denial rendered the family body unconditionally and skipped both
 
 - The CI coverage gate computes line coverage from the lcov export's per-line DA records instead of llvm-cov's summary table: llvm-cov 22's summary aggregation falsely reports missed lines that no line-level view (show text/html, lcov, cobertura, the JSON segment list) can see on the same profdata, and the divergence persists on the newest available toolchain (cargo-llvm-cov 0.9.1 + rustc 1.99.0). The gate keeps the same fail-closed 100%-lines semantics with nothing hidden or excluded; the summary table stays in the job as an informational printout. Evidence linked in the workflow (#37)
 
