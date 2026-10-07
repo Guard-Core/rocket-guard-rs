@@ -118,8 +118,33 @@
 //! ban/auto-ban stage (`GuardFairing::with_ip_banning`) skip whitelisted and
 //! exempt IPs for exactly what the reference skips (rate limiting, violation
 //! counting, banning) and never skip detection, which always scans every
-//! request, exempt or not. A user-agent filter and cloud-provider blocking
-//! do not exist yet.
+//! request, exempt or not.
+//!
+//! ## The full stage surface (the reference 17-check pipeline, wired)
+//!
+//! Every reference check the engine ships is now installable on
+//! [`GuardFairing`], and the fairing runs the installed set in the
+//! reference pipeline order (the stateful pass splits at the reference
+//! seams: the ban arm before geo/cloud/user-agent, the rate-limit tiers
+//! after, and the HTTPS redirect renders in the fairing's `on_response`
+//! pass, because Rocket catchers are `400`-`599` only):
+//!
+//! | Reference check | Builder |
+//! |---|---|
+//! | 2 `emergency_mode` | [`GuardFairing::with_emergency_mode`] |
+//! | 3 `https_enforcement` | [`GuardFairing::with_https_enforcement`] |
+//! | 4 `request_logging` | [`GuardFairing::with_request_logging`] |
+//! | 5 `request_size_content` | [`GuardFairing::with_body_cap`] (413) |
+//! | 6 + 7 `required_headers` / authentication | [`GuardFairing::with_headers_auth`] |
+//! | 8 referrer | [`GuardFairing::with_referrer_gate`] |
+//! | 9 `custom_validators` | [`GuardFairing::with_custom_checks`] |
+//! | 10 `time_window` | [`GuardFairing::with_time_window_gate`] |
+//! | 12b geo country blocking | [`GuardFairing::with_geo_blocking`] |
+//! | 13 `cloud_provider` | [`GuardFairing::with_cloud_provider`] |
+//! | 14 `user_agent` | [`GuardFairing::with_user_agent`] |
+//! | 12a / 15 / 16 bans / `rate_limit` / detection feed | [`GuardFairing::with_rate_limiting`] + [`GuardFairing::with_ip_banning`] |
+//! | 17 `custom_request` | [`GuardFairing::with_custom_checks`] |
+//! | response pass (return rules + security headers + CORS) | [`GuardFairing::with_response_processor`] |
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family)

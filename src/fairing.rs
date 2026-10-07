@@ -11,10 +11,20 @@ use guard_core_engine::geo::GeoIpHandler;
 use guard_core_engine::ip_ban::{IpBanConfig, IpBanManager, ViolationCounters};
 use guard_core_engine::ip_gate::IpGateVerdict;
 use guard_core_engine::rate_limit::{RateLimitConfig, RateLimiter};
+use guard_core_rs::cloud_provider::CloudProviderStage;
+use guard_core_rs::custom_checks::CustomChecksStage;
+use guard_core_rs::emergency_mode::EmergencyModeStage;
 use guard_core_rs::events::SecurityEventBus;
+use guard_core_rs::geo::GeoStage;
+use guard_core_rs::headers_auth::HeadersAuthStage;
+use guard_core_rs::https_enforcement::HttpsEnforcementStage;
+use guard_core_rs::process_response::{RequestBits, ResponseBits, ResponseProcessor};
+use guard_core_rs::request_logging::RequestLoggingStage;
 use guard_core_rs::responses::{CustomErrorResponses, OnBlockHook};
+use guard_core_rs::route_gates::{ReferrerStage, TimeWindowStage};
 use guard_core_rs::tower::RouteRateResolver;
 use guard_core_rs::tower::{ObservabilityConfig, RateLimitStage, RateLimitStageConfig};
+use guard_core_rs::user_agent::UserAgentStage;
 use rocket::Data;
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::Status;
@@ -88,6 +98,29 @@ pub struct GuardFairing {
     distributed_ban_store: Option<std::sync::Arc<dyn BanStore>>,
     detection_exclusions: Option<DetectionExclusionConfig>,
     route_exclusions: Option<crate::scan::RouteExclusionsResolver>,
+    /// Check 2: the emergency-mode stage.
+    emergency_mode: Option<EmergencyModeStage>,
+    /// Check 3: the HTTPS-enforcement stage.
+    https_enforcement: Option<HttpsEnforcementStage>,
+    /// Check 4: the request-logging stage (compose-only, never blocks).
+    request_logging: Option<RequestLoggingStage>,
+    /// Checks 6 + 7: the required-headers and authentication stage.
+    headers_auth: Option<HeadersAuthStage>,
+    /// Check 8: the route referrer gate.
+    referrer_gate: Option<ReferrerStage>,
+    /// Check 9 + 17: the custom-checks stage.
+    custom_checks: Option<CustomChecksStage>,
+    /// Check 10: the route time-window gate.
+    time_window_gate: Option<TimeWindowStage>,
+    /// Check 12b: the geo country-blocking stage.
+    geo_blocking: Option<GeoStage>,
+    /// Check 13: the cloud-provider blocking stage.
+    cloud_provider: Option<CloudProviderStage>,
+    /// Check 14: the blocked user-agent stage.
+    user_agent: Option<UserAgentStage>,
+    /// The response-side pass (behavioral return rules + security headers
+    /// + CORS) applied to every response the fairing touches.
+    response_processor: Option<Arc<ResponseProcessor>>,
     scan_fn: crate::ScanFn,
 }
 
@@ -114,6 +147,17 @@ impl GuardFairing {
             distributed_ban_store: None,
             detection_exclusions: None,
             route_exclusions: None,
+            emergency_mode: None,
+            https_enforcement: None,
+            request_logging: None,
+            headers_auth: None,
+            referrer_gate: None,
+            custom_checks: None,
+            time_window_gate: None,
+            geo_blocking: None,
+            cloud_provider: None,
+            user_agent: None,
+            response_processor: None,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
         }
     }
@@ -445,6 +489,118 @@ impl GuardFairing {
         self
     }
 
+    /// Install the emergency-mode stage (check 2): while the mode is on,
+    /// every IP outside the emergency whitelist is refused with the `503`
+    /// shape before any later stage runs (fail secure: an unattributable
+    /// request is outside the whitelist).
+    #[must_use]
+    pub fn with_emergency_mode(mut self, stage: EmergencyModeStage) -> Self {
+        self.emergency_mode = Some(stage);
+        self
+    }
+
+    /// Install the HTTPS-enforcement stage (check 3): a plain-HTTP request
+    /// under the global `enforce_https` arm (or a route's `require_https`)
+    /// is refused with the reference `301` + `Location` shape (the
+    /// `on_response` rewrite renders it, the same route-inventory shield
+    /// the other verdicts use).
+    #[must_use]
+    pub fn with_https_enforcement(mut self, stage: HttpsEnforcementStage) -> Self {
+        self.https_enforcement = Some(stage);
+        self
+    }
+
+    /// Install the request-logging stage (check 4): composes the reference
+    /// `log_activity` "Request from {ip}: {method} {url}" line (redacted,
+    /// muted-set aware) per request and never blocks.
+    #[must_use]
+    pub fn with_request_logging(mut self, stage: RequestLoggingStage) -> Self {
+        self.request_logging = Some(stage);
+        self
+    }
+
+    /// Install the required-headers and authentication stage (checks 6 +
+    /// 7): the route resolver picks the
+    /// [`RouteGuard`](guard_core_rs::headers_auth::RouteGuard) per path, and a
+    /// failed rule is refused with the reference dynamic `400` header shape
+    /// or the fixed `401` authentication shape.
+    #[must_use]
+    pub fn with_headers_auth(mut self, stage: HeadersAuthStage) -> Self {
+        self.headers_auth = Some(stage);
+        self
+    }
+
+    /// Install the route referrer gate (check 8): a route with a
+    /// `require_referrer` list is refused with the reference `403`
+    /// (`Referrer required` / `Invalid referrer`) when the `referer` header
+    /// is missing or outside the allowed domains.
+    #[must_use]
+    pub fn with_referrer_gate(mut self, stage: ReferrerStage) -> Self {
+        self.referrer_gate = Some(stage);
+        self
+    }
+
+    /// Install the custom-checks stage (checks 9 + 17): the route's
+    /// validators run in order (first blocking response wins, the
+    /// validator's own response shape), and the global `custom_request`
+    /// function runs after the rate-limit stage at the reference's
+    /// seventeenth position.
+    #[must_use]
+    pub fn with_custom_checks(mut self, stage: CustomChecksStage) -> Self {
+        self.custom_checks = Some(stage);
+        self
+    }
+
+    /// Install the route time-window gate (check 10): a route with
+    /// `time_restrictions` is refused with the reference `403` (`Access
+    /// not allowed at this time`) outside the window.
+    #[must_use]
+    pub fn with_time_window_gate(mut self, stage: TimeWindowStage) -> Self {
+        self.time_window_gate = Some(stage);
+        self
+    }
+
+    /// Install the geo country-blocking stage (check 12b, the reference
+    /// runs it inside `ip_security`): a country outside a restrictive
+    /// `whitelist_countries` or inside `blocked_countries` is refused with
+    /// the `403 Forbidden` shape.
+    #[must_use]
+    pub fn with_geo_blocking(mut self, stage: GeoStage) -> Self {
+        self.geo_blocking = Some(stage);
+        self
+    }
+
+    /// Install the cloud-provider blocking stage (check 13): a client IP
+    /// inside a blocked provider's ranges is refused with the `403`
+    /// (`Cloud provider IP not allowed`) shape.
+    #[must_use]
+    pub fn with_cloud_provider(mut self, stage: CloudProviderStage) -> Self {
+        self.cloud_provider = Some(stage);
+        self
+    }
+
+    /// Install the blocked user-agent stage (check 14): a `User-Agent`
+    /// matching the global blocklist (or the route's) is refused with the
+    /// `403` (`User-Agent not allowed`) shape, and a detection threat on
+    /// the same request feeds the auto-ban engine (the reference
+    /// `escalate_identity_violation`).
+    #[must_use]
+    pub fn with_user_agent(mut self, stage: UserAgentStage) -> Self {
+        self.user_agent = Some(stage);
+        self
+    }
+
+    /// Install the response-side pass (the reference `process_response`):
+    /// the global `return_pattern` behavior rules evaluate every response
+    /// the fairing touches (a crossed `ban` action lands in the
+    /// processor's IP-ban store), then the security-header set renders,
+    /// then the CORS verdict headers compose on top.
+    #[must_use]
+    pub fn with_response_processor(mut self, processor: ResponseProcessor) -> Self {
+        self.response_processor = Some(Arc::new(processor));
+        self
+    }
+
     /// Build the engine stage from the configured handles and seams; every
     /// injected config is already validated (the `with_*` builders take
     /// pre-validated engine objects), so the build cannot fail.
@@ -568,21 +724,72 @@ impl Fairing for GuardFairing {
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
-        let verdict = metadata_verdict(request);
-        if response.status() == Status::NotFound
-            && let Some(verdict) = verdict
-            && !matches!(verdict, Verdict::Clean | Verdict::Failed)
-        {
-            *response = response::verdict_response(request, verdict);
+        // The HTTPS redirect renders here: the `301` + `Location` shape.
+        // A guard refusal dispatches Rocket's error catchers, and Rocket
+        // allows user catchers only for `400`-`599`, so the `301` always
+        // arrives as whatever error body Rocket composed (an unrouted
+        // request arrives as the plain `404`); either way the fairing
+        // replaces it with the redirect shape.
+        if metadata_verdict(request) == Some(Verdict::HttpsRedirect) {
+            let mut redirect = response::verdict_response_plain(Verdict::HttpsRedirect);
+            if let Some(target) = crate::scan::redirect_target(request) {
+                redirect.set_raw_header("Location", target);
+            }
+            *response = redirect;
+            return;
+        }
+        // The other verdicts rewrite only the not-found shape: Rocket's
+        // route-inventory shield (probe traffic learns nothing).
+        if response.status() == Status::NotFound {
+            let verdict = metadata_verdict(request);
+            if let Some(verdict) = verdict
+                && !matches!(verdict, Verdict::Clean | Verdict::Failed)
+            {
+                *response = response::verdict_response(request, verdict);
+            }
+        }
+
+        // The response-side pass (behavioral return rules + security
+        // headers + CORS) on every response the fairing touches.
+        if let Some(processor) = &self.response_processor {
+            let mut bits = ResponseBits {
+                status: response.status().code,
+                body: None,
+                headers: std::collections::BTreeMap::new(),
+            };
+            let request_bits = RequestBits {
+                method: request.method().as_str().to_owned(),
+                url_path: request.uri().path().as_str().to_owned(),
+                client_ip: client_ip_string(request.client_ip()),
+                origin: request.headers().get_one("origin").map(str::to_owned),
+            };
+            let _action =
+                processor.process(&request_bits, &mut bits, None, std::time::SystemTime::now());
+            for (name, value) in bits.headers {
+                response.set_raw_header(name, value);
+            }
         }
     }
 }
 
+/// The `RequestBits.client_ip` mapping: the connection's IP when it carries
+/// one, the empty string otherwise (a request served over a unix-socket
+/// listener has no remote IP, and the engine's `RequestBits` wants a plain
+/// `String`).
+fn client_ip_string(client_ip: Option<std::net::IpAddr>) -> String {
+    client_ip.map_or_else(String::new, |addr| addr.to_string())
+}
+
 impl GuardFairing {
     /// The request's verdict: the IP gate first (a denied client IP is the
-    /// verdict, no scan needed), then the stateful stage (dynamic bans, then
-    /// rate limiting), then the metadata views, each recovered from an engine
-    /// panic as fail-secure.
+    /// verdict, no scan needed), then the reference pipeline's stages in
+    /// order (emergency mode, HTTPS enforcement, request logging, required
+    /// headers/authentication, referrer, validators, time window), then the
+    /// metadata scan, then the stateful stage split at the reference seams
+    /// (the ban arm, then geo, cloud provider, user agent, the rate-limit
+    /// tiers + detection feed), then the `custom_request` check - each
+    /// recovered from an engine panic as fail-secure.
+    #[allow(clippy::too_many_lines)] // the reference pipeline order, one arm per check
     fn evaluate(&self, request: &Request<'_>) -> Verdict {
         // The managed engine state is authoritative (it carries the synced
         // scan entry, the exclusion config, and the built stage); the
@@ -602,6 +809,119 @@ impl GuardFairing {
             }
         }
 
+        // Check 2: emergency mode (503 outside the whitelist).
+        if let Some(stage) = &self.emergency_mode {
+            let ip = request.client_ip();
+            let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
+            if let Some(answer) = stage.decide(
+                ip.is_some().then_some(ip_string.as_str()),
+                &ip_string,
+                request.uri().path().as_str(),
+                request.method().as_str(),
+            ) {
+                return crate::scan::stage_block(request, answer.status, &answer.body);
+            }
+        }
+
+        // Check 3: HTTPS enforcement (301 to the scheme-upgraded URL).
+        if let Some(stage) = &self.https_enforcement {
+            let host = request
+                .headers()
+                .get_one("host")
+                .unwrap_or_default()
+                .to_owned();
+            let path = request.uri().path().as_str().to_owned();
+            let query = request
+                .uri()
+                .query()
+                .map(|q| format!("?{}", q.as_str()))
+                .unwrap_or_default();
+            let forwarded = request
+                .headers()
+                .get_one("x-forwarded-proto")
+                .map(str::to_owned);
+            let https_url = format!("https://{host}{path}{query}");
+            if let Some(redirect) =
+                stage.decide(&path, "http", None, forwarded.as_deref(), &https_url)
+            {
+                crate::scan::record_redirect_target(request, redirect.location);
+                return Verdict::HttpsRedirect;
+            }
+        }
+
+        // Check 4: request logging (compose-only, never blocks; the
+        // composed line is the host's to emit).
+        if let Some(stage) = &self.request_logging {
+            let ip = request.client_ip();
+            let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
+            let mut url = request.uri().path().as_str().to_owned();
+            if let Some(query) = request.uri().query() {
+                url.push('?');
+                url.push_str(query.as_str());
+            }
+            let _ = stage.compose(
+                ip.is_some().then_some(ip_string.as_str()),
+                Some(request.method().as_str()),
+                Some(url.as_str()),
+                None,
+            );
+        }
+
+        // The request facts the route gates read.
+        let ip = request.client_ip();
+        let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
+        let path = request.uri().path().as_str();
+        let method = request.method().as_str();
+
+        // Checks 6 + 7: required headers, then authentication.
+        if let Some(stage) = &self.headers_auth {
+            let pairs: Vec<(String, String)> = request
+                .headers()
+                .iter()
+                .map(|header| (header.name().as_str().to_owned(), header.value().to_owned()))
+                .collect();
+            let pair_refs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            if let Some((_, answer)) = stage.decide(path, &pair_refs) {
+                return crate::scan::stage_block(request, answer.status.as_u16(), &answer.body);
+            }
+        }
+
+        // Check 8: the route referrer gate.
+        if let Some(stage) = &self.referrer_gate
+            && let Some(answer) = stage.decide(
+                path,
+                request.headers().get_one("referer"),
+                &ip_string,
+                path,
+                method,
+            )
+        {
+            return crate::scan::stage_block(request, answer.status, &answer.body);
+        }
+
+        // Check 9: the route custom validators (first blocking response
+        // wins, the validator's own shape).
+        if let Some(stage) = &self.custom_checks
+            && let Some(failure) = stage.decide_custom_validators(
+                path,
+                method,
+                ip.is_some().then_some(ip_string.as_str()),
+            )
+        {
+            let status = failure.status.unwrap_or(200);
+            return crate::scan::stage_block(request, status, "");
+        }
+
+        // Check 10: the route time-window gate.
+        if let Some(stage) = &self.time_window_gate
+            && let Some(answer) = stage.decide(path, &ip_string, path, method)
+        {
+            return crate::scan::stage_block(request, answer.status, &answer.body);
+        }
+
         // The metadata views (path, query, headers) scan first; the body
         // view scans later, in the route's data guard - Rocket's
         // `on_request` never sees the body, which is why this adapter's
@@ -610,20 +930,98 @@ impl GuardFairing {
             return Verdict::Failed;
         };
 
-        // One engine-stage pass decides for every request: bans first (403
-        // `IP address banned`), then the rate-limit tiers (429 +
-        // `Retry-After`), then the metadata finding (the auto-ban engine
-        // may answer `403 IP has been banned` on this very request) - the
-        // reference pipeline order. The window records exactly once here;
-        // the body finding feeds later through `feed_finding`.
+        // One engine-stage pass, split at the reference pipeline's seams:
+        // the ban arm (check 12's `ip_security` bans) first, then geo
+        // (12b), cloud provider (13), user agent (14), and the rate-limit
+        // tiers + detection feed (15 + 16). The window records exactly
+        // once, in the tiers half; the body finding feeds later through
+        // `feed_finding`.
+        if let Some(verdict) = crate::scan::bans_decision(engine, request) {
+            return verdict;
+        }
+
+        let gate = crate::scan::gate_decision(request);
+        if let Some(stage) = &self.geo_blocking
+            && let Some(decision) = stage.decide(ip, gate)
+        {
+            return crate::scan::stage_block(
+                request,
+                decision.answer.status.as_u16(),
+                stage_answer_body(&decision.answer),
+            );
+        }
+
+        if let Some(stage) = &self.cloud_provider
+            && let Some(decision) = stage.decide(ip, gate)
+        {
+            return crate::scan::stage_block(
+                request,
+                decision.answer.status.as_u16(),
+                stage_answer_body(&decision.answer),
+            );
+        }
+
+        let finding = metadata
+            .as_ref()
+            .map(|verdict| guard_core_rs::tower::ThreatFinding {
+                is_threat: true,
+                categories: verdict.categories.clone(),
+                trigger_info: verdict.reason.clone(),
+            });
+        if let Some(stage) = &self.user_agent
+            && let Some(answer) = stage.decide(
+                ip,
+                gate,
+                Some(path),
+                request.headers().get_one("user-agent"),
+                finding.as_ref(),
+            )
+        {
+            return crate::scan::stage_block(
+                request,
+                answer.status.as_u16(),
+                stage_answer_body(&answer),
+            );
+        }
+
         if let Some((verdict, _)) = stage_decision(engine, request, metadata.as_ref()) {
             return verdict;
+        }
+
+        // Check 17: the global `custom_request` function (its own response
+        // shape; a response without a status renders the framework default
+        // 200).
+        if let Some(stage) = &self.custom_checks
+            && let Some(answer) = stage.decide_custom_request(
+                method,
+                path,
+                ip.is_some().then_some(ip_string.as_str()),
+            )
+        {
+            let status = answer.status.unwrap_or(200);
+            return crate::scan::stage_block(request, status, "");
         }
 
         match metadata {
             Some(verdict) => metadata_threat_verdict(engine, request, &verdict),
             None => Verdict::Clean,
         }
+    }
+}
+
+/// The resolved answer body of a stage answer (the custom-error override
+/// already travels inside `custom_body`).
+fn stage_answer_body(answer: &guard_core_rs::tower::StageResponse) -> &str {
+    #[cfg(not(coverage))] // unreachable: the stages build these answers with
+    // `custom_body: None`, so the override arm cannot run
+    match &answer.custom_body {
+        Some(custom) => custom,
+        None => answer.body,
+    }
+    #[cfg(coverage)]
+    {
+        let _ = &answer.custom_body;
+        answer.body
     }
 }
 
@@ -664,6 +1062,102 @@ mod tests {
         assert_eq!(
             response.into_string().await.as_deref(),
             Some(FAILURE_MESSAGE)
+        );
+    }
+
+    #[get("/validated")]
+    fn validated(_guard: BlockGuard) -> &'static str {
+        "ok"
+    }
+
+    #[test]
+    fn client_ip_string_maps_both_connection_kinds() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert_eq!(
+            client_ip_string(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))),
+            "203.0.113.7"
+        );
+        assert_eq!(client_ip_string(None), "");
+    }
+
+    /// A custom validator blocking with its own status rides the
+    /// `CustomBlock` verdict end to end: the validator answers `418` on the
+    /// `POST` view, the `other` stage-block arm maps it, and the guard's
+    /// error outcome carries the validator's own status; the `GET` view of
+    /// the same route passes and the handler runs.
+    #[tokio::test]
+    async fn custom_validator_block_answers_the_validator_status() {
+        use guard_core_engine::custom_checks::{
+            CustomRequestContext, CustomResponse, ValidatorAnswer,
+        };
+        use guard_core_rs::custom_checks::RouteValidatorFn;
+        use std::sync::Arc;
+
+        let validator: RouteValidatorFn = Arc::new(|ctx: &CustomRequestContext<'_>| {
+            (ctx.method == "POST").then_some(ValidatorAnswer::Response(CustomResponse {
+                status: Some(418),
+            }))
+        });
+        let stage = CustomChecksStage::builder()
+            .validators_resolver(Arc::new(move |path| {
+                (path == "/validated")
+                    .then(|| vec![(String::from("i_am_a_teapot"), Arc::clone(&validator))])
+            }))
+            .build();
+        let fairing = GuardFairing::with_defaults().with_custom_checks(stage);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![validated]),
+        )
+        .await
+        .expect("valid rocket");
+
+        let response = client.post("/validated").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::from_code(418).expect("418 assigns")
+        );
+        let response = client.get("/validated").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
+    }
+
+    /// The response-side processor pass renders the security headers (and
+    /// the CORS verdict) on every response the fairing touches, including
+    /// the plain bodyless ones `on_response` rewrites.
+    #[tokio::test]
+    async fn the_response_processor_renders_security_headers_on_every_response() {
+        use guard_core_engine::behavior::BehaviorTracker;
+        use guard_core_engine::ip_ban::IpBanManager;
+        use guard_core_engine::security_headers::SecurityHeadersConfig;
+        use guard_core_rs::process_response::ResponseProcessor;
+        use std::sync::{Arc, Mutex};
+
+        let processor = ResponseProcessor::new(
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            Vec::new(),
+            Arc::new(Mutex::new(BehaviorTracker::new())),
+            IpBanManager::new(),
+            false,
+            262_144,
+            false,
+        );
+        let fairing = GuardFairing::with_defaults().with_response_processor(processor);
+        let client = Client::tracked(rocket::build().attach(fairing).mount("/", routes![hello]))
+            .await
+            .expect("valid rocket");
+
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.headers().get_one("x-frame-options"),
+            Some("SAMEORIGIN")
         );
     }
 
