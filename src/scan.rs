@@ -11,6 +11,7 @@ use guard_core_engine::detection_exclusions::{
     RouteDetectionExclusions, resolve as resolve_exclusions,
 };
 use guard_core_engine::ip_gate::IpGateDecision;
+use guard_core_engine::route_config::RouteConfig;
 use guard_core_rs::responses::OnBlockHook;
 use guard_core_rs::tower::{
     ObservabilityConfig, RateLimitStage, RequestObservation, StageResponse,
@@ -396,7 +397,11 @@ pub(crate) fn stage_decision(
 ) -> Option<(Verdict, Option<String>)> {
     // The tiers + detection-feed half only: the ban arm ran earlier in the
     // fairing's `on_request` pass, at the reference position (before the
-    // geo, cloud-provider, and user-agent checks).
+    // geo, cloud-provider, and user-agent checks). The `rate_limit`
+    // bypass skips the whole pass for the route.
+    if carrier_bypasses(route_carrier(request).as_deref(), "rate_limit") {
+        return None;
+    }
     let stage = engine.stage.as_ref()?;
     let finding = finding.map(|verdict| guard_core_rs::tower::ThreatFinding {
         is_threat: true,
@@ -421,6 +426,11 @@ pub(crate) fn stage_decision(
 /// The ban arm alone (the reference `ip_security` ban check): the fairing's
 /// first stage pass, before the geo, cloud-provider, and user-agent checks.
 pub(crate) fn bans_decision(engine: &GuardEngine, request: &Request<'_>) -> Option<Verdict> {
+    // The reference `ip_security` bypass skips the ban arm (the fused
+    // `ip_security` block).
+    if carrier_bypasses(route_carrier(request).as_deref(), "ip_security") {
+        return None;
+    }
     let stage = engine.stage.as_ref()?;
     let decision =
         stage.decide_bans_observed(request.client_ip(), Some(&request_observation(request)))?;
@@ -537,6 +547,62 @@ pub(crate) struct RouteTiers(pub(crate) std::sync::Mutex<Option<crate::RouteRate
 /// (`custom_error_responses`). Interior-mutable for the same reason.
 pub(crate) struct BlockBody(pub(crate) std::sync::Mutex<Option<String>>);
 
+/// The stashed per-route `RouteConfig` carrier (the fairing resolves it
+/// once in `on_request`; the stage fns and the guards read the slot).
+pub(crate) struct RouteCarrier(pub(crate) std::sync::Mutex<Option<std::sync::Arc<RouteConfig>>>);
+
+/// Stash the resolved route carrier for the stage fns and the guards.
+pub(crate) fn stash_route_carrier(
+    request: &Request<'_>,
+    config: Option<std::sync::Arc<RouteConfig>>,
+) {
+    *request
+        .local_cache(|| RouteCarrier(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route carrier slot") = config;
+}
+
+/// The resolved route carrier, if this request carries one.
+pub(crate) fn route_carrier(request: &Request<'_>) -> Option<std::sync::Arc<RouteConfig>> {
+    request
+        .local_cache(|| RouteCarrier(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route carrier slot")
+        .clone()
+}
+
+/// The reference `RouteConfigResolver.should_bypass_check`: the named
+/// check, or the `"all"` wildcard.
+pub(crate) fn carrier_bypasses(carrier: Option<&RouteConfig>, check: &str) -> bool {
+    carrier.is_some_and(|route| {
+        route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
+    })
+}
+
+/// The route's effective body cap (`max_request_size`), stashed by the
+/// fairing for the data guard; `None` keeps the engine's cap.
+pub(crate) struct RouteBodyCap(pub(crate) std::sync::Mutex<Option<usize>>);
+
+/// Stash the route's body cap.
+pub(crate) fn stash_route_body_cap(request: &Request<'_>, cap: usize) {
+    *request
+        .local_cache(|| RouteBodyCap(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route body cap slot") = Some(cap);
+}
+
+/// The route's body cap, when the route set one.
+pub(crate) fn route_body_cap(request: &Request<'_>) -> Option<usize> {
+    *request
+        .local_cache(|| RouteBodyCap(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("route body cap slot")
+}
+
 /// Request-local slot for the HTTPS redirect target (check 3's
 /// scheme-upgraded URL). Interior-mutable for the same reason.
 pub(crate) struct RedirectTarget(pub(crate) std::sync::Mutex<Option<String>>);
@@ -565,6 +631,16 @@ pub(crate) struct RouteExclusions(pub(crate) std::sync::Mutex<Option<RouteDetect
 
 /// Read the route tier override, if a preceding fairing or guard set one.
 pub(crate) fn route_rate_limits(request: &Request<'_>) -> Option<crate::RouteRateLimits> {
+    // The carrier's rate-limit view wins over the direct extension (the
+    // carrier is the reference surface; the extension stays as the
+    // lower-level escape hatch).
+    if let Some(tiers) = route_carrier(request)
+        .as_deref()
+        .and_then(|route| route.rate_limits().ok())
+        .flatten()
+    {
+        return Some(tiers);
+    }
     request
         .local_cache(|| RouteTiers(std::sync::Mutex::new(None)))
         .0
@@ -576,6 +652,15 @@ pub(crate) fn route_rate_limits(request: &Request<'_>) -> Option<crate::RouteRat
 /// Set the per-route rate-limit tier override for this request (a
 /// preceding fairing or guard calls it before the request's security pass
 /// reads it).
+/// Attach a route's `RouteConfig` to the request directly (the reference
+/// `request.state.route_config` idiom). The carrier wins over the
+/// fairing's installed [`crate::GuardFairing::with_route_configs`]
+/// resolver, and its rate-limit view wins over
+/// [`set_route_rate_limits`].
+pub fn set_route_config(request: &Request<'_>, config: std::sync::Arc<RouteConfig>) {
+    stash_route_carrier(request, Some(config));
+}
+
 pub fn set_route_rate_limits(request: &Request<'_>, tiers: crate::RouteRateLimits) {
     *request
         .local_cache(|| RouteTiers(std::sync::Mutex::new(None)))

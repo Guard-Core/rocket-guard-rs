@@ -188,7 +188,7 @@ pub use crate::response::{
     ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
     OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, guard_catchers,
 };
-pub use crate::scan::{set_route_detection_exclusions, set_route_rate_limits};
+pub use crate::scan::{set_route_config, set_route_detection_exclusions, set_route_rate_limits};
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
 pub use guard_core_engine::detection_exclusions::{
     DetectionExclusionConfig, RouteDetectionExclusions,
@@ -206,6 +206,7 @@ pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_engine::route_config::{RouteConfig, RouteConfigResolver};
 pub use guard_core_engine::security_config::{
     BufferOverflowPolicy, LogFormat, LogLevel, SecurityConfig, SecurityConfigError,
 };

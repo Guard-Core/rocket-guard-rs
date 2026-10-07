@@ -124,6 +124,11 @@ pub struct GuardFairing {
     /// The reference `exclude_paths`: request paths that bypass the whole
     /// pipeline (the docs/static carve-out).
     exclude_paths: Vec<String>,
+    /// The reference `RouteConfigResolver` (`(method, path) ->
+    /// Option<Arc<RouteConfig>>`): the per-route carrier the pipeline
+    /// consumes. An `Arc<RouteConfig>` stashed with
+    /// `set_route_config` wins over the resolver.
+    route_configs: Option<guard_core_engine::route_config::RouteConfigResolver>,
     scan_fn: crate::ScanFn,
 }
 
@@ -162,6 +167,7 @@ impl GuardFairing {
             user_agent: None,
             response_processor: None,
             exclude_paths: Vec::new(),
+            route_configs: None,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
         }
     }
@@ -183,6 +189,27 @@ impl GuardFairing {
     #[must_use]
     pub fn with_exclude_paths(mut self, paths: Vec<String>) -> Self {
         self.exclude_paths = paths;
+        self
+    }
+
+    /// Install the reference `RouteConfigResolver` (the
+    /// [`guard_core_engine::route_config::RouteConfig`] carrier):
+    /// `(method, path) -> Option<Arc<RouteConfig>>`. The resolved route's
+    /// knobs apply on top of the global config for that route only, the
+    /// reference `RouteConfigResolver` semantics: `bypassed_checks` (and
+    /// the `"all"` wildcard) skip the named reference checks,
+    /// `require_https` forces the reference `301`, `max_request_size`
+    /// replaces the body cap, `blocked_user_agents` is evaluated
+    /// additively before the global filter, the rate-limit group becomes
+    /// the route's tier, and the detection-exclusion group resolves
+    /// through the engine's detection view. An `Arc<RouteConfig>`
+    /// stashed with [`crate::set_route_config`] wins over the resolver.
+    #[must_use]
+    pub fn with_route_configs(
+        mut self,
+        resolver: guard_core_engine::route_config::RouteConfigResolver,
+    ) -> Self {
+        self.route_configs = Some(resolver);
         self
     }
 
@@ -1014,7 +1041,32 @@ impl GuardFairing {
             return Verdict::Clean;
         }
 
-        if let Some(gate) = &self.ip_gate
+        // The reference `RouteConfigResolver`: the stashed carrier (the
+        // app attached one with `set_route_config`) wins over the
+        // installed resolver. The resolved carrier rides the request-local
+        // slot the stage fns and the guards read; an invalid rate-limit
+        // view fails secure before any stage runs.
+        let carrier: Option<std::sync::Arc<guard_core_engine::route_config::RouteConfig>> =
+            crate::scan::route_carrier(request).or_else(|| {
+                self.route_configs
+                    .as_ref()
+                    .and_then(|resolver| resolver(request.method().as_str(), path))
+            });
+        crate::scan::stash_route_carrier(request, carrier.clone());
+        let route = carrier.as_deref();
+        let bypassed = |check: &str| crate::scan::carrier_bypasses(route, check);
+        if let Some(Err(_)) = route.map(guard_core_engine::route_config::RouteConfig::rate_limits) {
+            return Verdict::Failed;
+        }
+        if let Some(size) = route
+            .and_then(|route| route.max_request_size)
+            .and_then(|size| usize::try_from(size).ok())
+        {
+            crate::scan::stash_route_body_cap(request, size);
+        }
+
+        if !bypassed("ip_security")
+            && let Some(gate) = &self.ip_gate
             && let Some(ip) = request.client_ip()
         {
             match gate.evaluate(ip) {
@@ -1060,7 +1112,9 @@ impl GuardFairing {
         }
 
         // Check 2: emergency mode (503 outside the whitelist).
-        if let Some(stage) = &self.emergency_mode {
+        if !bypassed("emergency_mode")
+            && let Some(stage) = &self.emergency_mode
+        {
             let ip = request.client_ip();
             let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
             if let Some(answer) = stage.decide(
@@ -1074,7 +1128,10 @@ impl GuardFairing {
         }
 
         // Check 3: HTTPS enforcement (301 to the scheme-upgraded URL).
-        if let Some(stage) = &self.https_enforcement {
+        // The route's `require_https` rides the same stage (the carrier
+        // lane), so the trust knobs and the passive handling match the
+        // global arm.
+        if !bypassed("https_enforcement") {
             let host = request
                 .headers()
                 .get_one("host")
@@ -1091,9 +1148,32 @@ impl GuardFairing {
                 .get_one("x-forwarded-proto")
                 .map(str::to_owned);
             let https_url = format!("https://{host}{path}{query}");
-            if let Some(redirect) =
-                stage.decide(&path, "http", None, forwarded.as_deref(), &https_url)
-            {
+            let route_require_https = route.is_some_and(|route| route.require_https);
+            let answer = if let Some(stage) = &self.https_enforcement {
+                // A carrier route rides the direct lane; with no carrier
+                // config the stage's own resolver seam (if installed)
+                // stays authoritative.
+                if let Some(route) = route {
+                    stage.decide_route(
+                        &path,
+                        "http",
+                        None,
+                        forwarded.as_deref(),
+                        &https_url,
+                        Some(route.require_https),
+                    )
+                } else {
+                    stage.decide(&path, "http", None, forwarded.as_deref(), &https_url)
+                }
+            } else if route_require_https && !self.passive_mode {
+                Some(guard_core_rs::https_enforcement::HttpsRedirectAnswer {
+                    status: 301,
+                    location: https_url.clone(),
+                })
+            } else {
+                None
+            };
+            if let Some(redirect) = answer {
                 crate::scan::record_redirect_target(request, redirect.location);
                 return Verdict::HttpsRedirect;
             }
@@ -1101,7 +1181,9 @@ impl GuardFairing {
 
         // Check 4: request logging (compose-only, never blocks; the
         // composed line is the host's to emit).
-        if let Some(stage) = &self.request_logging {
+        if !bypassed("request_logging")
+            && let Some(stage) = &self.request_logging
+        {
             let ip = request.client_ip();
             let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
             let mut url = request.uri().path().as_str().to_owned();
@@ -1123,8 +1205,12 @@ impl GuardFairing {
         let path = request.uri().path().as_str();
         let method = request.method().as_str();
 
-        // Checks 6 + 7: required headers, then authentication.
-        if let Some(stage) = &self.headers_auth {
+        // Checks 6 + 7: required headers, then authentication (the fused
+        // stage answers for both; bypassing either reference check skips
+        // the whole stage).
+        if !(bypassed("required_headers") || bypassed("authentication"))
+            && let Some(stage) = &self.headers_auth
+        {
             let pairs: Vec<(String, String)> = request
                 .headers()
                 .iter()
@@ -1140,7 +1226,8 @@ impl GuardFairing {
         }
 
         // Check 8: the route referrer gate.
-        if let Some(stage) = &self.referrer_gate
+        if !bypassed("referrer")
+            && let Some(stage) = &self.referrer_gate
             && let Some(answer) = stage.decide(
                 path,
                 request.headers().get_one("referer"),
@@ -1154,7 +1241,8 @@ impl GuardFairing {
 
         // Check 9: the route custom validators (first blocking response
         // wins, the validator's own shape).
-        if let Some(stage) = &self.custom_checks
+        if !bypassed("custom_validators")
+            && let Some(stage) = &self.custom_checks
             && let Some(failure) = stage.decide_custom_validators(
                 path,
                 method,
@@ -1166,7 +1254,8 @@ impl GuardFairing {
         }
 
         // Check 10: the route time-window gate.
-        if let Some(stage) = &self.time_window_gate
+        if !bypassed("time_window")
+            && let Some(stage) = &self.time_window_gate
             && let Some(answer) = stage.decide(path, &ip_string, path, method)
         {
             return crate::scan::stage_block(request, answer.status, &answer.body);
@@ -1176,8 +1265,15 @@ impl GuardFairing {
         // view scans later, in the route's data guard - Rocket's
         // `on_request` never sees the body, which is why this adapter's
         // flow is two-phase (see the module docs).
-        let Ok(metadata) = catch_unwind(AssertUnwindSafe(|| engine.scan_metadata(request))) else {
-            return Verdict::Failed;
+        // The reference `suspicious_activity` bypass skips the scan (and
+        // with it the violation feed) for the route.
+        let metadata = if bypassed("suspicious_activity") {
+            None
+        } else {
+            match catch_unwind(AssertUnwindSafe(|| engine.scan_metadata(request))) {
+                Ok(metadata) => metadata,
+                Err(_) => return Verdict::Failed,
+            }
         };
 
         // One engine-stage pass, split at the reference pipeline's seams:
@@ -1191,7 +1287,10 @@ impl GuardFairing {
         }
 
         let gate = crate::scan::gate_decision(request);
-        if let Some(stage) = &self.geo_blocking
+        // The reference runs the country arms inside `ip_security`: the
+        // same bypass skips the geo stage.
+        if !bypassed("ip_security")
+            && let Some(stage) = &self.geo_blocking
             && let Some(decision) = stage.decide(ip, gate)
         {
             return crate::scan::stage_block(
@@ -1201,7 +1300,8 @@ impl GuardFairing {
             );
         }
 
-        if let Some(stage) = &self.cloud_provider
+        if !bypassed("cloud_provider")
+            && let Some(stage) = &self.cloud_provider
             && let Some(decision) = stage.decide(ip, gate)
         {
             return crate::scan::stage_block(
@@ -1218,20 +1318,45 @@ impl GuardFairing {
                 categories: verdict.categories.clone(),
                 trigger_info: verdict.reason.clone(),
             });
-        if let Some(stage) = &self.user_agent
-            && let Some(answer) = stage.decide(
-                ip,
-                gate,
-                Some(path),
-                request.headers().get_one("user-agent"),
-                finding.as_ref(),
-            )
-        {
-            return crate::scan::stage_block(
-                request,
-                answer.status.as_u16(),
-                stage_answer_body(&answer),
-            );
+        if !bypassed("user_agent") {
+            // The route's `blocked_user_agents` runs additively before the
+            // global filter (the reference `check_user_agent_allowed`
+            // order); whitelisted and exempt IPs skip exactly what the
+            // stage skips. A non-compilable route pattern fails secure.
+            let route_blocks = route
+                .filter(|route| !route.blocked_user_agents.is_empty())
+                .filter(|_| {
+                    !gate.is_some_and(|decision| decision.is_whitelisted || decision.is_exempt)
+                })
+                .map(|route| {
+                    guard_core_engine::user_agent::UserAgentFilter::from_trusted_patterns(
+                        route.blocked_user_agents.iter().cloned(),
+                    )
+                });
+            match route_blocks {
+                Some(Ok(filter))
+                    if filter.is_blocked(request.headers().get_one("user-agent").unwrap_or("")) =>
+                {
+                    return crate::scan::stage_block(request, 403, "User-Agent not allowed");
+                }
+                Some(Err(_)) => return Verdict::Failed,
+                _ => {}
+            }
+            if let Some(stage) = &self.user_agent
+                && let Some(answer) = stage.decide(
+                    ip,
+                    gate,
+                    Some(path),
+                    request.headers().get_one("user-agent"),
+                    finding.as_ref(),
+                )
+            {
+                return crate::scan::stage_block(
+                    request,
+                    answer.status.as_u16(),
+                    stage_answer_body(&answer),
+                );
+            }
         }
 
         if let Some((verdict, _)) = stage_decision(engine, request, metadata.as_ref()) {
@@ -1241,7 +1366,8 @@ impl GuardFairing {
         // Check 17: the global `custom_request` function (its own response
         // shape; a response without a status renders the framework default
         // 200).
-        if let Some(stage) = &self.custom_checks
+        if !bypassed("custom_request")
+            && let Some(stage) = &self.custom_checks
             && let Some(answer) = stage.decide_custom_request(
                 method,
                 path,

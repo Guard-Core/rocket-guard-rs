@@ -142,10 +142,10 @@ impl<'r> FromData<'r> for GuardBody {
             return DataOutcome::Error((Status::InternalServerError, GuardBodyError));
         };
 
-        let capped = data
-            .open((engine.body_cap as u64).bytes())
-            .into_bytes()
-            .await;
+        // The route's `max_request_size` replaces the global cap for the
+        // route (stashed by the fairing's `on_request` pass).
+        let cap = crate::scan::route_body_cap(request).unwrap_or(engine.body_cap);
+        let capped = data.open((cap as u64).bytes()).into_bytes().await;
         let bytes = match capped {
             Ok(capped) if capped.is_complete() => capped.into_inner(),
             // The cap was hit: the engine would only ever see a truncated

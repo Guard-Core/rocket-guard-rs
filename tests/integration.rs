@@ -21,9 +21,10 @@ async fn body_text(response: LocalResponse<'_>) -> String {
 /// blocks happen before any handler runs; the POST echo route proves that
 /// `GuardBody` hands the intact bytes to the handler on clean requests.
 fn app(fairing: GuardFairing) -> rocket::Rocket<rocket::Build> {
-    rocket::build()
-        .attach(fairing)
-        .mount("/", routes![index, catch_all, echo])
+    rocket::build().attach(fairing).mount(
+        "/",
+        routes![index, open_route, tls_route, catch_all, echo, echo2],
+    )
 }
 
 /// Like [`app`], but without the catch-all route, so unmatched paths really
@@ -31,12 +32,22 @@ fn app(fairing: GuardFairing) -> rocket::Rocket<rocket::Build> {
 fn minimal_app(fairing: GuardFairing) -> rocket::Rocket<rocket::Build> {
     rocket::build()
         .attach(fairing)
-        .mount("/", routes![index, echo])
+        .mount("/", routes![index, open_route, tls_route, echo])
 }
 
 #[get("/")]
 fn index(_guard: BlockGuard) -> &'static str {
     "index"
+}
+
+#[get("/open")]
+fn open_route(_guard: BlockGuard) -> &'static str {
+    "open"
+}
+
+#[get("/tls")]
+fn tls_route(_guard: BlockGuard) -> &'static str {
+    "tls"
 }
 
 #[get("/<path..>")]
@@ -48,6 +59,12 @@ fn catch_all(path: PathBuf, _guard: BlockGuard) -> String {
 #[post("/echo", data = "<body>")]
 #[allow(clippy::needless_pass_by_value)] // data guards take `Data` by value
 fn echo(body: GuardBody) -> String {
+    String::from_utf8_lossy(body.as_ref()).into_owned()
+}
+
+#[post("/echo2", data = "<body>")]
+#[allow(clippy::needless_pass_by_value)] // data guards take `Data` by value
+fn echo2(body: GuardBody) -> String {
     String::from_utf8_lossy(body.as_ref()).into_owned()
 }
 
@@ -971,4 +988,434 @@ async fn request_logging_composes_without_blocking() {
     let response = client.get("/api/items?limit=5").dispatch().await;
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(body_text(response).await, "GET /api/items");
+}
+
+// --- the reference RouteConfig carrier consumption (GAP-R2) ---
+
+use rocket_guard_rs::{RouteConfig, RouteConfigResolver};
+
+fn resolver_for(paths: &[(&str, &str)], config: RouteConfig) -> RouteConfigResolver {
+    let owned: Vec<(String, String)> = paths
+        .iter()
+        .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+        .collect();
+    Arc::new(move |method, path| {
+        owned
+            .iter()
+            .any(|(route_method, route_path)| route_method == method && route_path == path)
+            .then(|| Arc::new(config.clone()))
+    })
+}
+
+/// A preceding `Kind::Request` fairing stashing a route config directly
+/// (the documented attach-order way; the carrier wins over the resolver).
+struct CarrierOverride(RouteConfig);
+
+#[rocket::async_trait]
+impl rocket::fairing::Fairing for CarrierOverride {
+    fn info(&self) -> rocket::fairing::Info {
+        rocket::fairing::Info {
+            name: "CarrierOverride",
+            kind: rocket::fairing::Kind::Request,
+        }
+    }
+
+    async fn on_request(&self, request: &mut rocket::Request<'_>, _data: &mut rocket::Data<'_>) {
+        rocket_guard_rs::set_route_config(request, Arc::new(self.0.clone()));
+    }
+}
+
+#[tokio::test]
+async fn route_config_bypasses_the_scan_for_its_path_only() {
+    let config = RouteConfig {
+        bypassed_checks: {
+            let mut set = std::collections::BTreeSet::new();
+            set.insert(String::from("suspicious_activity"));
+            set
+        },
+        ..RouteConfig::default()
+    };
+    let fairing =
+        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/open")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client.get("/open?q=1%27+OR+1%3D1").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    let response = client.get("/?q=1%27+OR+1%3D1").dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
+}
+
+#[tokio::test]
+async fn route_require_https_forces_the_redirect() {
+    let config = RouteConfig {
+        require_https: true,
+        ..RouteConfig::default()
+    };
+    let fairing =
+        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/tls")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client.get("/tls").dispatch().await;
+    assert_eq!(response.status(), Status::MovedPermanently);
+    let location = response
+        .headers()
+        .get_one("Location")
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        location.starts_with("https://"),
+        "the reference redirect upgrades the scheme: {location}"
+    );
+}
+
+#[tokio::test]
+async fn the_route_rate_view_becomes_the_tier() {
+    let config = RouteConfig {
+        rate_limit: Some(1),
+        rate_limit_window: Some(60),
+        ..RouteConfig::default()
+    };
+    let fairing = GuardFairing::with_defaults()
+        .with_rate_limiting(
+            rocket_guard_rs::RateLimiter::new(rocket_guard_rs::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1000,
+                rate_limit_window: 60,
+                ..rocket_guard_rs::RateLimitConfig::default()
+            })
+            .expect("valid config"),
+        )
+        .with_route_configs(resolver_for(&[("GET", "/")], config));
+    let client = Client::tracked(app(fairing)).await.expect("valid rocket");
+
+    let first = client
+        .get("/")
+        .remote(peer([192, 0, 2, 9]))
+        .dispatch()
+        .await;
+    assert_eq!(first.status(), Status::Ok);
+    let second = client
+        .get("/")
+        .remote(peer([192, 0, 2, 9]))
+        .dispatch()
+        .await;
+    assert_eq!(second.status(), Status::TooManyRequests);
+    assert_eq!(second.headers().get_one("Retry-After"), Some("60"));
+}
+
+#[tokio::test]
+async fn the_carrier_override_wins_over_the_resolver() {
+    let resolver_config = RouteConfig {
+        rate_limit: Some(1),
+        rate_limit_window: Some(60),
+        ..RouteConfig::default()
+    };
+    let fairing = GuardFairing::with_defaults()
+        .with_rate_limiting(
+            rocket_guard_rs::RateLimiter::new(rocket_guard_rs::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1000,
+                rate_limit_window: 60,
+                ..rocket_guard_rs::RateLimitConfig::default()
+            })
+            .expect("valid config"),
+        )
+        .with_route_configs(resolver_for(&[("GET", "/")], resolver_config));
+    let client = Client::tracked(
+        rocket::build()
+            .attach(CarrierOverride(RouteConfig::default()))
+            .attach(fairing)
+            .mount("/", routes![index, echo]),
+    )
+    .await
+    .expect("valid rocket");
+
+    let first = client.get("/").dispatch().await;
+    assert_eq!(first.status(), Status::Ok);
+    // The override carries no tier: the resolver's 1-request tier never
+    // applies.
+    let second = client.get("/").dispatch().await;
+    assert_eq!(second.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn route_blocked_user_agents_answer_the_403() {
+    let config = RouteConfig {
+        blocked_user_agents: vec![String::from("route-bot")],
+        ..RouteConfig::default()
+    };
+    let fairing =
+        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client
+        .get("/")
+        .header(Header::new("User-Agent", "route-bot/2.0"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "User-Agent not allowed");
+
+    let response = client.get("/").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn an_invalid_carrier_tier_fails_secure() {
+    let config = RouteConfig {
+        rate_limit: Some(0),
+        ..RouteConfig::default()
+    };
+    let fairing =
+        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client.get("/").dispatch().await;
+    assert_eq!(response.status(), Status::InternalServerError);
+    assert_eq!(body_text(response).await, "Security check failed");
+}
+
+#[tokio::test]
+async fn the_ip_security_bypass_skips_the_gate_for_its_route() {
+    let gate = rocket_guard_rs::IpGateConfig::new([] as [&str; 0], ["192.0.2.9"], [] as [&str; 0])
+        .expect("valid lists");
+    let config = RouteConfig {
+        bypassed_checks: {
+            let mut set = std::collections::BTreeSet::new();
+            set.insert(String::from("ip_security"));
+            set
+        },
+        ..RouteConfig::default()
+    };
+    let fairing = GuardFairing::with_defaults()
+        .with_ip_gate(gate)
+        .with_route_configs(resolver_for(&[("GET", "/open")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client
+        .get("/open")
+        .remote(peer([192, 0, 2, 9]))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let response = client
+        .get("/")
+        .remote(peer([192, 0, 2, 9]))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+}
+
+/// The gateway peer helper from the fairing tests is module-local; the
+/// integration twin builds its own.
+fn peer(ip: [u8; 4]) -> std::net::SocketAddr {
+    std::net::SocketAddr::from((ip, 45_000))
+}
+
+#[tokio::test]
+async fn route_max_request_size_answers_413() {
+    let config = RouteConfig {
+        max_request_size: Some(4),
+        ..RouteConfig::default()
+    };
+    let fairing = GuardFairing::with_defaults()
+        .with_route_configs(resolver_for(&[("POST", "/echo")], config));
+    let client = Client::tracked(app(fairing)).await.expect("valid rocket");
+
+    let response = client
+        .post("/echo")
+        .header(Header::new("Content-Type", "text/plain"))
+        .body("12345")
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::PayloadTooLarge);
+    assert_eq!(body_text(response).await, OVERSIZE_MESSAGE);
+
+    // The route cap does not travel: the same body forwards on the default
+    // cap elsewhere.
+    let response = client
+        .post("/echo2")
+        .header(Header::new("Content-Type", "text/plain"))
+        .body("12345")
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn route_require_https_rides_the_installed_stage_lane() {
+    let config = RouteConfig {
+        require_https: true,
+        ..RouteConfig::default()
+    };
+    let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
+        guard_core_rs::https_enforcement::HttpsEnforcementStageConfig::default(),
+    )
+    .build()
+    .expect("valid stage");
+    let fairing = GuardFairing::with_defaults()
+        .with_https_enforcement(stage)
+        .with_route_configs(resolver_for(&[("GET", "/tls")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client.get("/tls").dispatch().await;
+    assert_eq!(response.status(), Status::MovedPermanently);
+    // An unlisted path passes (the global arm is off).
+    let response = client.get("/open").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn the_https_enforcement_bypass_skips_both_arms_for_the_route() {
+    let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
+        guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
+            enforce_https: true,
+            trust_x_forwarded_proto: false,
+            passive_mode: false,
+        },
+    )
+    .build()
+    .expect("valid stage");
+    let config = RouteConfig {
+        require_https: true,
+        bypassed_checks: {
+            let mut set = std::collections::BTreeSet::new();
+            set.insert(String::from("https_enforcement"));
+            set
+        },
+        ..RouteConfig::default()
+    };
+    let fairing = GuardFairing::with_defaults()
+        .with_https_enforcement(stage)
+        .with_route_configs(resolver_for(&[("GET", "/tls")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    // Both the global arm and the route's require_https are skipped on
+    // the bypassed route.
+    let response = client.get("/tls").dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    // The global arm still answers next door.
+    let response = client.get("/open").dispatch().await;
+    assert_eq!(response.status(), Status::MovedPermanently);
+}
+
+#[tokio::test]
+async fn a_non_compilable_route_pattern_fails_secure() {
+    let config = RouteConfig {
+        blocked_user_agents: vec![String::from("([")],
+        ..RouteConfig::default()
+    };
+    let fairing =
+        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    let response = client.get("/").dispatch().await;
+    assert_eq!(response.status(), Status::InternalServerError);
+    assert_eq!(body_text(response).await, "Security check failed");
+}
+
+#[tokio::test]
+async fn the_user_agent_bypass_skips_both_lists_for_the_route() {
+    let config = RouteConfig {
+        blocked_user_agents: vec![String::from("route-bot")],
+        bypassed_checks: {
+            let mut set = std::collections::BTreeSet::new();
+            set.insert(String::from("user_agent"));
+            set
+        },
+        ..RouteConfig::default()
+    };
+    let stage = guard_core_rs::user_agent::UserAgentStage::builder(
+        guard_core_rs::user_agent::UserAgentStageConfig {
+            blocked_user_agents: UserAgentFilter::new(["global-bot"]).expect("valid patterns"),
+            ip_ban: rocket_guard_rs::IpBanConfig {
+                enable_ip_banning: false,
+                ..rocket_guard_rs::IpBanConfig::default()
+            },
+            passive_mode: false,
+        },
+    )
+    .build()
+    .expect("valid stage");
+    let _ = stage;
+    let fairing =
+        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/open")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    // The route list is skipped on the bypassed route.
+    let response = client
+        .get("/open")
+        .header(Header::new("User-Agent", "route-bot"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+}
+
+#[tokio::test]
+async fn the_rate_limit_bypass_skips_the_whole_pass_for_the_route() {
+    let config = RouteConfig {
+        bypassed_checks: {
+            let mut set = std::collections::BTreeSet::new();
+            set.insert(String::from("rate_limit"));
+            set
+        },
+        ..RouteConfig::default()
+    };
+    let fairing = GuardFairing::with_defaults()
+        .with_rate_limiting(
+            rocket_guard_rs::RateLimiter::new(rocket_guard_rs::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                rate_limit_window: 60,
+                ..rocket_guard_rs::RateLimitConfig::default()
+            })
+            .expect("valid config"),
+        )
+        .with_route_configs(resolver_for(&[("GET", "/open")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    // The bypassed route never consumes the window.
+    for _ in 0..3 {
+        let response = client
+            .get("/open")
+            .remote(peer([192, 0, 2, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+    // Outside the bypassed route the window records normally: the first
+    // request passes, the second crosses the 1-request window.
+    let response = client
+        .get("/")
+        .remote(peer([192, 0, 2, 9]))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let response = client
+        .get("/")
+        .remote(peer([192, 0, 2, 9]))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::TooManyRequests);
 }
