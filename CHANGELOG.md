@@ -2,7 +2,11 @@
 
 All notable changes to this project.
 
-## [1.4.0] - 2026-10-07
+v1.4.0 (2026-10-07)
+-------------------
+
+The reference-surface release: the status route lands in managed state, training with the 4.3.1 parity-completion engine (v1.4.0)
+---------------------------------------------------------------------------------------------------------------------------------
 
 ### Note
 
