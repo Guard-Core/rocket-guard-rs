@@ -1065,7 +1065,7 @@ impl GuardFairing {
             crate::scan::stash_route_body_cap(request, size);
         }
 
-        if !bypassed("ip_security")
+        if !bypassed("ip")
             && let Some(gate) = &self.ip_gate
             && let Some(ip) = request.client_ip()
         {
@@ -1111,10 +1111,10 @@ impl GuardFairing {
             }
         }
 
-        // Check 2: emergency mode (503 outside the whitelist).
-        if !bypassed("emergency_mode")
-            && let Some(stage) = &self.emergency_mode
-        {
+        // Check 2: emergency mode (503 outside the whitelist). The
+        // reference pipeline never consults the bypass set here: the
+        // global stage is not route-bypassable.
+        if let Some(stage) = &self.emergency_mode {
             let ip = request.client_ip();
             let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
             if let Some(answer) = stage.decide(
@@ -1131,7 +1131,7 @@ impl GuardFairing {
         // The route's `require_https` rides the same stage (the carrier
         // lane), so the trust knobs and the passive handling match the
         // global arm.
-        if !bypassed("https_enforcement") {
+        {
             let host = request
                 .headers()
                 .get_one("host")
@@ -1181,9 +1181,7 @@ impl GuardFairing {
 
         // Check 4: request logging (compose-only, never blocks; the
         // composed line is the host's to emit).
-        if !bypassed("request_logging")
-            && let Some(stage) = &self.request_logging
-        {
+        if let Some(stage) = &self.request_logging {
             let ip = request.client_ip();
             let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
             let mut url = request.uri().path().as_str().to_owned();
@@ -1208,9 +1206,7 @@ impl GuardFairing {
         // Checks 6 + 7: required headers, then authentication (the fused
         // stage answers for both; bypassing either reference check skips
         // the whole stage).
-        if !(bypassed("required_headers") || bypassed("authentication"))
-            && let Some(stage) = &self.headers_auth
-        {
+        if let Some(stage) = &self.headers_auth {
             let pairs: Vec<(String, String)> = request
                 .headers()
                 .iter()
@@ -1226,8 +1222,7 @@ impl GuardFairing {
         }
 
         // Check 8: the route referrer gate.
-        if !bypassed("referrer")
-            && let Some(stage) = &self.referrer_gate
+        if let Some(stage) = &self.referrer_gate
             && let Some(answer) = stage.decide(
                 path,
                 request.headers().get_one("referer"),
@@ -1241,12 +1236,16 @@ impl GuardFairing {
 
         // Check 9: the route custom validators (first blocking response
         // wins, the validator's own shape).
-        if !bypassed("custom_validators")
-            && let Some(stage) = &self.custom_checks
+        if let Some(stage) = &self.custom_checks
+            // No body at this phase: Rocket's `on_request` never sees the
+            // body (the data guard owns it), so the validators' body view
+            // is `None` here - the reference validators read the request
+            // body, a divergence the two-phase flow documents.
             && let Some(failure) = stage.decide_custom_validators(
                 path,
                 method,
                 ip.is_some().then_some(ip_string.as_str()),
+                None,
             )
         {
             let status = failure.status.unwrap_or(200);
@@ -1254,8 +1253,7 @@ impl GuardFairing {
         }
 
         // Check 10: the route time-window gate.
-        if !bypassed("time_window")
-            && let Some(stage) = &self.time_window_gate
+        if let Some(stage) = &self.time_window_gate
             && let Some(answer) = stage.decide(path, &ip_string, path, method)
         {
             return crate::scan::stage_block(request, answer.status, &answer.body);
@@ -1267,7 +1265,7 @@ impl GuardFairing {
         // flow is two-phase (see the module docs).
         // The reference `suspicious_activity` bypass skips the scan (and
         // with it the violation feed) for the route.
-        let metadata = if bypassed("suspicious_activity") {
+        let metadata = if bypassed("penetration") {
             None
         } else {
             match catch_unwind(AssertUnwindSafe(|| engine.scan_metadata(request))) {
@@ -1287,9 +1285,9 @@ impl GuardFairing {
         }
 
         let gate = crate::scan::gate_decision(request);
-        // The reference runs the country arms inside `ip_security`: the
-        // same bypass skips the geo stage.
-        if !bypassed("ip_security")
+        // The reference runs the country arms inside the `ip`-gated
+        // block: the same bypass skips the geo stage.
+        if !bypassed("ip")
             && let Some(stage) = &self.geo_blocking
             && let Some(decision) = stage.decide(ip, gate)
         {
@@ -1300,7 +1298,7 @@ impl GuardFairing {
             );
         }
 
-        if !bypassed("cloud_provider")
+        if !bypassed("clouds")
             && let Some(stage) = &self.cloud_provider
             && let Some(decision) = stage.decide(ip, gate)
         {
@@ -1318,7 +1316,7 @@ impl GuardFairing {
                 categories: verdict.categories.clone(),
                 trigger_info: verdict.reason.clone(),
             });
-        if !bypassed("user_agent") {
+        {
             // The route's `blocked_user_agents` runs additively before the
             // global filter (the reference `check_user_agent_allowed`
             // order); whitelisted and exempt IPs skip exactly what the
@@ -1366,12 +1364,12 @@ impl GuardFairing {
         // Check 17: the global `custom_request` function (its own response
         // shape; a response without a status renders the framework default
         // 200).
-        if !bypassed("custom_request")
-            && let Some(stage) = &self.custom_checks
+        if let Some(stage) = &self.custom_checks
             && let Some(answer) = stage.decide_custom_request(
                 method,
                 path,
                 ip.is_some().then_some(ip_string.as_str()),
+                None,
             )
         {
             let status = answer.status.unwrap_or(200);
@@ -1482,6 +1480,7 @@ mod tests {
         let validator: RouteValidatorFn = Arc::new(|ctx: &CustomRequestContext<'_>| {
             (ctx.method == "POST").then_some(ValidatorAnswer::Response(CustomResponse {
                 status: Some(418),
+                body: None,
             }))
         });
         let stage = CustomChecksStage::builder()
