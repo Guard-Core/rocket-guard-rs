@@ -146,6 +146,24 @@
 //! | 17 `custom_request` | [`GuardFairing::with_custom_checks`] |
 //! | response pass (return rules + security headers + CORS) | [`GuardFairing::with_response_processor`] |
 //!
+//! ## The unified configuration surface
+//!
+//! [`GuardFairing::from_security_config`] builds the whole wired pipeline
+//! from the engine's [`SecurityConfig`] (the reference 129-field
+//! configuration surface) in one fail-closed call: the detection budgets,
+//! the IP lists onto the gate, the rate-limit and ban groups,
+//! `enforce_https`, `emergency_mode` + its whitelist,
+//! `custom_error_responses`/`on_block`, the detection-exclusion group, the
+//! observability group, the ReDoS-validated `blocked_user_agents`, and the
+//! security-headers/CORS/behavior response pass. The reference
+//! `exclude_paths` carve-out rides along as a first-class builder consumed
+//! first in the pipeline (an excluded path bypasses every request-side
+//! check, gate included). Invalid values fail closed through the typed
+//! [`GuardConfigError`]. The stages that need a host-provided collaborator
+//! (the geo handler, the distributed stores, the event bus, the custom
+//! checks, the time-window and referrer resolvers) stay opt-in through
+//! their own builders.
+//!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family)
 //! but the adapter is deliberately **fail-secure**, unlike the TypeScript
@@ -188,6 +206,10 @@ pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_engine::security_config::{
+    BufferOverflowPolicy, LogFormat, LogLevel, SecurityConfig, SecurityConfigError,
+};
+pub use guard_core_engine::security_headers::SecurityHeadersConfig;
 pub use guard_core_rs::events::SecurityEventBus;
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
 pub use guard_core_rs::tower::{
@@ -257,6 +279,78 @@ pub const fn default_config() -> DetectConfig {
     }
 }
 
+/// Why [`GuardFairing::from_security_config`] refused a value: the engine
+/// constructor that rejected it, fail-closed.
+#[derive(Debug)]
+pub enum GuardConfigError {
+    /// An IP/CIDR list entry the gate cannot parse.
+    IpGate(IpGateError),
+    /// A zero rate-limit knob.
+    RateLimit(RateLimitConfigError),
+    /// A blocked user-agent pattern the `ReDoS` validator rejected.
+    UserAgent(guard_core_engine::user_agent::UserAgentConfigError),
+    /// An invalid auto-ban knob group.
+    Ban(IpBanConfigError),
+}
+
+impl std::fmt::Display for GuardConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IpGate(error) => write!(f, "ip list: {error}"),
+            Self::RateLimit(error) => write!(f, "rate limit: {error}"),
+            Self::UserAgent(error) => write!(f, "blocked user agent: {error}"),
+            Self::Ban(error) => write!(f, "ip ban: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GuardConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IpGate(error) => Some(error),
+            Self::RateLimit(error) => Some(error),
+            Self::UserAgent(error) => Some(error),
+            Self::Ban(error) => Some(error),
+        }
+    }
+}
+
+impl From<IpGateError> for GuardConfigError {
+    fn from(error: IpGateError) -> Self {
+        Self::IpGate(error)
+    }
+}
+
+impl From<RateLimitConfigError> for GuardConfigError {
+    fn from(error: RateLimitConfigError) -> Self {
+        Self::RateLimit(error)
+    }
+}
+
+impl From<guard_core_engine::user_agent::UserAgentConfigError> for GuardConfigError {
+    fn from(error: guard_core_engine::user_agent::UserAgentConfigError) -> Self {
+        Self::UserAgent(error)
+    }
+}
+
+impl From<IpBanConfigError> for GuardConfigError {
+    fn from(error: IpBanConfigError) -> Self {
+        Self::Ban(error)
+    }
+}
+
+/// The engine log level mapped onto the logging facade's enum (the
+/// reference literals are the same strings).
+pub(crate) fn map_log_level(level: LogLevel) -> guard_core_rs::logging::LogLevel {
+    match level {
+        LogLevel::Info => guard_core_rs::logging::LogLevel::Info,
+        LogLevel::Debug => guard_core_rs::logging::LogLevel::Debug,
+        LogLevel::Warning => guard_core_rs::logging::LogLevel::Warning,
+        LogLevel::Error => guard_core_rs::logging::LogLevel::Error,
+        LogLevel::Critical => guard_core_rs::logging::LogLevel::Critical,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +372,81 @@ mod tests {
         assert_eq!(fairing.engine_body_cap(), 262_144);
         let fairing = fairing.with_body_cap(1024);
         assert_eq!(fairing.engine_body_cap(), 1024);
+    }
+
+    #[test]
+    fn guard_config_error_display_and_source_cover_every_variant() {
+        let ip_gate: GuardConfigError = IpGateError {
+            list: "whitelist",
+            entry: String::from("nope"),
+        }
+        .into();
+        assert!(ip_gate.to_string().contains("ip list"));
+        assert!(std::error::Error::source(&ip_gate).is_some());
+
+        let rate_limit: GuardConfigError = RateLimitConfigError {
+            field: std::borrow::Cow::Borrowed("rate_limit"),
+            reason: "must be at least 1",
+        }
+        .into();
+        assert!(rate_limit.to_string().contains("rate limit"));
+        assert!(std::error::Error::source(&rate_limit).is_some());
+
+        let user_agent: GuardConfigError = guard_core_engine::user_agent::UserAgentConfigError {
+            entry: String::from("bad-bot"),
+            reason: String::from("rejected"),
+        }
+        .into();
+        assert!(user_agent.to_string().contains("blocked user agent"));
+        assert!(std::error::Error::source(&user_agent).is_some());
+
+        let ban: GuardConfigError = IpBanConfigError::NonPositive {
+            field: "auto_ban_threshold",
+        }
+        .into();
+        assert!(ban.to_string().contains("ip ban"));
+        assert!(std::error::Error::source(&ban).is_some());
+    }
+
+    #[test]
+    fn map_log_level_covers_every_reference_level() {
+        assert!(matches!(
+            map_log_level(LogLevel::Info),
+            guard_core_rs::logging::LogLevel::Info
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Debug),
+            guard_core_rs::logging::LogLevel::Debug
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Warning),
+            guard_core_rs::logging::LogLevel::Warning
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Error),
+            guard_core_rs::logging::LogLevel::Error
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Critical),
+            guard_core_rs::logging::LogLevel::Critical
+        ));
+    }
+
+    #[test]
+    fn from_security_config_exclude_paths_round_trip_through_the_accessor() {
+        let config = SecurityConfig {
+            exclude_paths: vec![String::from("/docs")],
+            ..SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        assert_eq!(fairing.exclude_paths(), ["/docs"]);
+    }
+
+    #[test]
+    fn with_exclude_paths_round_trips_through_the_accessor() {
+        let fairing = GuardFairing::with_defaults()
+            .with_exclude_paths(vec![String::from("/docs"), String::from("/static")]);
+        assert_eq!(fairing.exclude_paths(), ["/docs", "/static"]);
     }
 
     #[test]

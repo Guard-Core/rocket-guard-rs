@@ -121,6 +121,9 @@ pub struct GuardFairing {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the fairing touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `exclude_paths`: request paths that bypass the whole
+    /// pipeline (the docs/static carve-out).
+    exclude_paths: Vec<String>,
     scan_fn: crate::ScanFn,
 }
 
@@ -158,6 +161,7 @@ impl GuardFairing {
             cloud_provider: None,
             user_agent: None,
             response_processor: None,
+            exclude_paths: Vec::new(),
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
         }
     }
@@ -166,6 +170,206 @@ impl GuardFairing {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(crate::default_config())
+    }
+
+    /// The request paths that bypass the whole pipeline (the reference
+    /// `exclude_paths` carve-out, exact path match).
+    #[must_use]
+    pub fn exclude_paths(&self) -> &[String] {
+        &self.exclude_paths
+    }
+
+    /// Set the `exclude_paths` carve-out.
+    #[must_use]
+    pub fn with_exclude_paths(mut self, paths: Vec<String>) -> Self {
+        self.exclude_paths = paths;
+        self
+    }
+
+    /// Build the fairing from the unified `SecurityConfig`
+    /// (the reference configuration surface): every field the fairing
+    /// consumes maps onto the wired stage or knob it owns, in one place,
+    /// with the reference semantics - the same consumption the tower
+    /// adapter ships under `GuardLayer::from_security_config`.
+    ///
+    /// The stages that need a host-provided collaborator (the geo handler,
+    /// the distributed stores, the event bus, the custom checks, the
+    /// time-window and referrer resolvers) stay opt-in through their own
+    /// builders: the config carries no such object.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::GuardConfigError`] when an engine constructor rejects a
+    /// value (an invalid IP/CIDR list entry, a zero rate-limit knob, or a
+    /// ReDoS-unsafe blocked user-agent pattern).
+    #[allow(clippy::too_many_lines)]
+    pub fn from_security_config(
+        config: &guard_core_engine::security_config::SecurityConfig,
+    ) -> Result<Self, crate::GuardConfigError> {
+        let mut fairing = Self::new(guard_core_engine::detect::DetectConfig {
+            max_content_length: config.detection_max_content_length,
+            max_full_scan_bytes: config.detection_max_body_inspect_bytes,
+            preserve_attack_patterns: config.detection_preserve_attack_patterns,
+            semantic_threshold: config.detection_semantic_threshold,
+            threat_score_threshold: config.detection_threat_score_threshold,
+            binary_min_run_length: config.detection_binary_min_run_length,
+        })
+        .with_passive_mode(config.passive_mode)
+        .with_exclude_paths(config.exclude_paths.clone());
+
+        if config.whitelist.is_some()
+            || !config.blacklist.is_empty()
+            || !config.exempt_ips.is_empty()
+        {
+            fairing = fairing.with_ip_gate(guard_core_engine::ip_gate::IpGateConfig::new(
+                config.whitelist.clone().unwrap_or_default(),
+                config.blacklist.iter().cloned(),
+                config.exempt_ips.iter().cloned(),
+            )?);
+        }
+
+        if config.enable_rate_limiting {
+            let limiter = RateLimiter::new(RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: config.rate_limit,
+                rate_limit_window: config.rate_limit_window,
+                ..RateLimitConfig::default()
+            })?;
+            fairing = fairing.with_rate_limiting(limiter);
+        }
+
+        if config.enable_ip_banning {
+            fairing = fairing.with_ip_banning(IpBanManager::new(), config.ip_ban_config());
+        }
+
+        // Check 3: the global HTTPS arm; `X-Forwarded-Proto` trust rides
+        // the same knobs the reference reads them from.
+        fairing = fairing.with_https_enforcement(
+            HttpsEnforcementStage::builder(
+                guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
+                    enforce_https: config.enforce_https,
+                    trust_x_forwarded_proto: config.trust_x_forwarded_proto,
+                    passive_mode: config.passive_mode,
+                },
+            )
+            .build()?,
+        );
+
+        if config.emergency_mode || !config.emergency_whitelist.is_empty() {
+            fairing = fairing.with_emergency_mode(
+                EmergencyModeStage::builder(
+                    guard_core_rs::emergency_mode::EmergencyModeStageConfig {
+                        emergency_mode: config.emergency_mode,
+                        passive_mode: config.passive_mode,
+                    },
+                )
+                .emergency_whitelist(config.emergency_whitelist.iter().cloned())
+                .build()?,
+            );
+        }
+
+        if !config.custom_error_responses.is_empty() {
+            fairing = fairing.with_custom_error_responses(
+                config
+                    .custom_error_responses
+                    .iter()
+                    .map(|(status, body)| (*status, body.clone()))
+                    .collect(),
+            );
+        }
+
+        if let Some(hook) = config.on_block.clone() {
+            fairing = fairing.with_on_block(hook);
+        }
+
+        if !config.excluded_detection_headers.is_empty()
+            || !config.excluded_detection_params.is_empty()
+            || !config.excluded_detection_body_fields.is_empty()
+            || !config.enabled_detection_categories.is_empty()
+        {
+            fairing = fairing.with_detection_exclusions(DetectionExclusionConfig {
+                excluded_detection_headers: config
+                    .excluded_detection_headers
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_detection_params: config
+                    .excluded_detection_params
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_detection_body_fields: config
+                    .excluded_detection_body_fields
+                    .iter()
+                    .cloned()
+                    .collect(),
+                enabled_detection_categories: (!config.enabled_detection_categories.is_empty())
+                    .then(|| {
+                        config
+                            .enabled_detection_categories
+                            .iter()
+                            .cloned()
+                            .collect()
+                    }),
+                detection_scan_body: Some(config.detection_scan_body),
+            });
+        }
+
+        if let Some(level) = config.log_suspicious_level {
+            fairing = fairing.with_observability(ObservabilityConfig {
+                log_suspicious_level: Some(crate::map_log_level(level)),
+                muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                sensitive: guard_core_rs::redact::SensitiveNames::new(
+                    Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                    Some(&config.log_sensitive_params.iter().cloned().collect()),
+                    Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                ),
+            });
+        }
+
+        if !config.blocked_user_agents.is_empty() {
+            fairing = fairing.with_user_agent(
+                UserAgentStage::builder(guard_core_rs::user_agent::UserAgentStageConfig {
+                    // The error arm takes its own line: the coverage
+                    // mapping attributes the `?` return to the function
+                    // exit, so an inline `?` here renders count 0 forever.
+                    blocked_user_agents: guard_core_engine::user_agent::UserAgentFilter::new(
+                        config.blocked_user_agents.iter().cloned(),
+                    )
+                    .map_err(crate::GuardConfigError::from)?,
+                    ip_ban: config.ip_ban_config(),
+                    passive_mode: config.passive_mode,
+                })
+                .build()?,
+            );
+        }
+
+        let wants_headers = config.security_headers.enabled;
+        if wants_headers || config.enable_cors || !config.global_behavior_rules.is_empty() {
+            let cors = config
+                .enable_cors
+                .then(|| guard_core_engine::cors::CorsConfig {
+                    enabled: true,
+                    allow_origins: config.cors_allow_origins.clone(),
+                    allow_methods: config.cors_allow_methods.clone(),
+                    allow_headers: config.cors_allow_headers.clone(),
+                    allow_credentials: config.cors_allow_credentials,
+                });
+            fairing = fairing.with_response_processor(ResponseProcessor::new(
+                wants_headers.then_some(config.security_headers.clone()),
+                cors,
+                config.global_behavior_rules.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    guard_core_engine::behavior::BehaviorTracker::new(),
+                )),
+                IpBanManager::new(),
+                config.behavior_scan_response_body,
+                config.behavior_max_response_body_inspect_bytes,
+                config.passive_mode,
+            ));
+        }
+
+        Ok(fairing)
     }
 
     /// Install the global IP gate: a `whitelist`/`blacklist`/`exempt_ips`
@@ -800,11 +1004,57 @@ impl GuardFairing {
             .state::<GuardEngine>()
             .unwrap_or(&self.engine);
         let _ = &self.engine;
+
+        // The reference `exclude_paths` carve-out runs first: the
+        // docs/static paths bypass the whole pipeline (exact path match),
+        // detection included. The response-side pass still renders (the
+        // fairing's `on_response`).
+        let path = request.uri().path().as_str();
+        if self.exclude_paths.iter().any(|excluded| excluded == path) {
+            return Verdict::Clean;
+        }
+
         if let Some(gate) = &self.ip_gate
             && let Some(ip) = request.client_ip()
         {
             match gate.evaluate(ip) {
-                IpGateVerdict::Denied(_) => return Verdict::IpBlocked,
+                IpGateVerdict::Denied(denial) => {
+                    // The reference `ip_filter` block path: passive mode
+                    // logs the crossing and forwards (no verdict is
+                    // stashed and no gate decision recorded, so the
+                    // request proceeds exactly like an unattributed one),
+                    // the `on_block` hook fires once with the reference
+                    // payload keys, and the custom-error body override
+                    // wins over the family default.
+                    if !self.passive_mode {
+                        let ip_string = ip.to_string();
+                        // The custom-error body override wins over the
+                        // family default; with no override the catcher's
+                        // verdict arm renders the family default itself.
+                        if let Some(custom) = engine.custom_error_responses.get(&403) {
+                            crate::scan::record_block_body(request, Some(custom.clone()));
+                        }
+                        if let Some(observability) = &engine.observability {
+                            let observation = crate::scan::request_observation(request);
+                            let payload = guard_core_rs::responses::build_block_payload(
+                                "ip_security",
+                                &format!("IP address blocked: {ip_string}"),
+                                denial.reason(),
+                                false,
+                                &ip_string,
+                                observation.url.as_deref().unwrap_or("/"),
+                                observation.method.as_deref().unwrap_or(""),
+                                Some(403),
+                                &observability.sensitive,
+                            );
+                            guard_core_rs::responses::fire_block_hook(
+                                engine.on_block.as_ref(),
+                                &payload,
+                            );
+                        }
+                        return Verdict::IpBlocked;
+                    }
+                }
                 IpGateVerdict::Allowed(decision) => record_gate_decision(request, decision),
             }
         }
@@ -1048,6 +1298,16 @@ mod tests {
     #[get("/hello")]
     fn hello(_guard: BlockGuard) -> &'static str {
         "ok"
+    }
+
+    #[test]
+    fn from_security_config_user_agent_stage_is_wired() {
+        let config = guard_core_engine::security_config::SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..guard_core_engine::security_config::SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        assert!(fairing.user_agent.is_some());
     }
 
     #[tokio::test]
@@ -2364,5 +2624,384 @@ mod stateful_tests {
             );
         }
         panic!("body scan exploded");
+    }
+
+    // --- the unified SecurityConfig consumption (from_security_config) ---
+
+    use guard_core_engine::security_config::SecurityConfig;
+    #[get("/docs")]
+    fn docs(_guard: BlockGuard) -> &'static str {
+        "docs"
+    }
+
+    fn peer_ip(ip: [u8; 4]) -> SocketAddr {
+        SocketAddr::from((ip, 45_000))
+    }
+
+    async fn tracked_config(fairing: GuardFairing) -> Client {
+        Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful, docs]),
+        )
+        .await
+        .expect("valid rocket")
+    }
+
+    #[tokio::test]
+    async fn from_security_config_defaults_screen_clean_traffic() {
+        let config = SecurityConfig::default();
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn from_security_config_enforce_https_redirects_http() {
+        let config = SecurityConfig {
+            enforce_https: true,
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::MovedPermanently);
+        let location = response
+            .headers()
+            .get_one("Location")
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            location.starts_with("https://"),
+            "the reference redirect upgrades the scheme: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_emergency_mode_blocks_outside_the_whitelist() {
+        let config = SecurityConfig {
+            emergency_mode: true,
+            emergency_whitelist: vec![String::from("198.51.100.7")],
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([198, 51, 100, 7]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_blocked_user_agent_answers_the_403() {
+        let config = SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .header(rocket::http::Header::new("User-Agent", "bad-bot/1.0"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some("User-Agent not allowed")
+        );
+
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_exclude_paths_bypass_the_pipeline() {
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            exclude_paths: vec![String::from("/docs")],
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        // An excluded path bypasses every check, gate included: the
+        // blacklisted IP forwards on /docs.
+        let response = client
+            .get("/docs")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("docs"));
+        // Any other path takes the gate denial.
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    #[test]
+    fn from_security_config_invalid_ip_list_entry_fails_closed() {
+        let config = SecurityConfig {
+            whitelist: Some(vec![String::from("not-an-ip")]),
+            ..SecurityConfig::default()
+        };
+        let error = GuardFairing::from_security_config(&config).unwrap_err();
+        assert!(matches!(error, crate::GuardConfigError::IpGate(_)));
+    }
+
+    #[tokio::test]
+    async fn from_security_config_rate_limit_crossing_answers_429() {
+        let config = SecurityConfig {
+            rate_limit: 1,
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let first = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(first.status(), Status::Ok);
+        let second = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(second.status(), Status::TooManyRequests);
+        assert_eq!(second.headers().get_one("Retry-After"), Some("60"));
+        assert_eq!(
+            second.into_string().await.as_deref(),
+            Some(crate::RATE_LIMITED_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_custom_error_responses_render() {
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            custom_error_responses: {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(403, String::from("custom-forbidden"));
+                map
+            },
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        // The custom-error body override wins over the family default.
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some("custom-forbidden")
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_ip_gate_denial_fires_the_on_block_hook() {
+        type HookLog = Arc<std::sync::Mutex<Vec<(String, Option<u16>)>>>;
+        let seen: HookLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: crate::OnBlockHook = Arc::new(move |payload: &crate::BlockPayload| {
+            sink.lock()
+                .expect("sink")
+                .push((payload.check_name.clone(), payload.status_code));
+        });
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            on_block: Some(hook),
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let seen = seen.lock().expect("sink");
+        assert!(
+            seen.iter()
+                .any(|(check, status)| check == "ip_security" && *status == Some(403)),
+            "the reference on_block hook fires once with the ip_security keys: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_ip_gate_denial_under_passive_mode_forwards() {
+        let config = SecurityConfig {
+            passive_mode: true,
+            blacklist: vec![String::from("203.0.113.9")],
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn from_security_config_disabled_rate_limiting_forwards_freely() {
+        let config = SecurityConfig {
+            enable_rate_limiting: false,
+            rate_limit: 1,
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        for _ in 0..3 {
+            let response = client
+                .get("/hello")
+                .remote(peer_ip([203, 0, 113, 9]))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+        }
+    }
+
+    #[test]
+    fn from_security_config_zero_rate_limit_fails_closed() {
+        let config = SecurityConfig {
+            rate_limit: 0,
+            ..SecurityConfig::default()
+        };
+        let error = GuardFairing::from_security_config(&config).unwrap_err();
+        assert!(matches!(error, crate::GuardConfigError::RateLimit(_)));
+    }
+
+    #[tokio::test]
+    async fn from_security_config_detection_exclusions_and_categories_reach_the_scan() {
+        let config = SecurityConfig {
+            enabled_detection_categories: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("xss"));
+                set
+            },
+            excluded_detection_params: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("q"));
+                set
+            },
+            detection_scan_body: false,
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        // The sqli category is disabled by the enabled-categories override:
+        // the sqli probe forwards.
+        let response = client
+            .get("/hello?q=1%27+OR+1%3D1")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_security_headers_and_cors_render() {
+        let config = SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec![String::from("https://app.test")],
+            ..SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .header(rocket::http::Header::new("Origin", "https://app.test"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.headers().get_one("access-control-allow-origin"),
+            Some("https://app.test")
+        );
+    }
+
+    #[test]
+    fn from_security_config_empty_category_set_skips_the_exclusion_block() {
+        // The reference's empty `enabled_detection_categories` frozenset:
+        // an explicitly empty set disables every category, and the
+        // detection-exclusion block is not installed at all.
+        let config = SecurityConfig {
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            ..SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        assert!(fairing.detection_exclusions.is_none());
+    }
+
+    #[test]
+    fn from_security_config_disabled_security_headers_skip_the_processor() {
+        let config = SecurityConfig {
+            security_headers: guard_core_engine::security_headers::SecurityHeadersConfig {
+                enabled: false,
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            },
+            ..SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        assert!(fairing.response_processor.is_none());
+    }
+
+    #[tokio::test]
+    async fn from_security_config_exclude_paths_still_render_the_response_pass() {
+        let config = SecurityConfig::default();
+        let client =
+            tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
+        let response = client
+            .get("/docs")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        // The forwarded response still carries the security-header set: the
+        // carve-out bypasses the request-side checks, not the response pass.
+        assert_eq!(
+            response.headers().get_one("x-content-type-options"),
+            Some("nosniff")
+        );
     }
 }
