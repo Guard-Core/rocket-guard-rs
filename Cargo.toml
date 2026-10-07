@@ -3,7 +3,7 @@ members = ["examples/simple_app", "examples/advanced_app"]
 
 [package]
 name = "rocket-guard-rs"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Application-layer security Fairing for Rocket, powered by the guard-core-rs engine. Part of the guard ecosystem."
@@ -17,17 +17,17 @@ categories = ["web-programming"]
 name = "rocket_guard_rs"
 
 [dependencies]
-# guard-core-engine is published to crates.io (4.3.0); the path points at the
+# guard-core-engine is published to crates.io (4.3.1); the path points at the
 # engine crate inside a sibling guard-core-rs checkout so local builds and CI
 # (see .github/workflows/ci.yml) exercise the engine from source. The version
 # pin stays in lockstep with the published engine release.
-guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", version = "4.3.0" }
+guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", version = "4.3.1" }
 # The engine facade (the event bus, observability knobs, the on_block hook,
 # custom error responses, and the rate-limit stage the fairing delegates to).
 # Path points at the sibling guard-core-rs checkout so local builds and CI
 # exercise it from source; the version pin stays in lockstep with the
 # published facade release.
-guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.0" }
+guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.1" }
 rocket = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]

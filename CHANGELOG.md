@@ -2,6 +2,16 @@
 
 All notable changes to this project.
 
+## [1.4.0] - 2026-10-07
+
+### Note
+
+- Trains with the engine: the `guard-core-engine` and `guard-core-rs` floors move to 4.3.1 (the parity-completion release)
+
+### Added
+
+- The reference status route (fastapi-guard `add_status_route` + `HandlerInitializer.get_initialization_status`): `GuardStatus` in managed state plus the `guard_status` route handler mounted at `/_guard/status`, serving the cloud-provider readiness table and the geo-ip component from the handles the app already holds (#38). The WebSocket upgrade guard has no surface here: rocket has no stable 0.5 WS surface to guard
+
 ## [Unreleased]
 
 ## [1.3.0] - 2026-10-01
