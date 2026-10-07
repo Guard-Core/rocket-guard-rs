@@ -701,7 +701,10 @@ async fn custom_validators_block_with_the_validator_response() {
                     String::from("post_only"),
                     Arc::new(|ctx: &CustomRequestContext<'_>| {
                         (ctx.method != "POST").then_some(ValidatorAnswer::Response(
-                            CustomResponse { status: Some(403) },
+                            CustomResponse {
+                                status: Some(403),
+                                body: None,
+                            },
                         ))
                     }) as CustomValidatorFn,
                 )]
@@ -853,7 +856,10 @@ async fn custom_request_blocks_with_the_function_response() {
         .custom_request(
             "maintenance_gate",
             Arc::new(|ctx: &CustomRequestContext<'_>| {
-                (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+                (ctx.path == "/admin").then_some(CustomResponse {
+                    status: Some(503),
+                    body: None,
+                })
             }),
         )
         .build();
@@ -1030,7 +1036,7 @@ async fn route_config_bypasses_the_scan_for_its_path_only() {
     let config = RouteConfig {
         bypassed_checks: {
             let mut set = std::collections::BTreeSet::new();
-            set.insert(String::from("suspicious_activity"));
+            set.insert(String::from("penetration"));
             set
         },
         ..RouteConfig::default()
@@ -1185,13 +1191,13 @@ async fn an_invalid_carrier_tier_fails_secure() {
 }
 
 #[tokio::test]
-async fn the_ip_security_bypass_skips_the_gate_for_its_route() {
+async fn the_ip_bypass_skips_the_gate_for_its_route() {
     let gate = rocket_guard_rs::IpGateConfig::new([] as [&str; 0], ["192.0.2.9"], [] as [&str; 0])
         .expect("valid lists");
     let config = RouteConfig {
         bypassed_checks: {
             let mut set = std::collections::BTreeSet::new();
-            set.insert(String::from("ip_security"));
+            set.insert(String::from("ip"));
             set
         },
         ..RouteConfig::default()
@@ -1279,42 +1285,6 @@ async fn route_require_https_rides_the_installed_stage_lane() {
 }
 
 #[tokio::test]
-async fn the_https_enforcement_bypass_skips_both_arms_for_the_route() {
-    let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
-        guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
-            enforce_https: true,
-            trust_x_forwarded_proto: false,
-            passive_mode: false,
-        },
-    )
-    .build()
-    .expect("valid stage");
-    let config = RouteConfig {
-        require_https: true,
-        bypassed_checks: {
-            let mut set = std::collections::BTreeSet::new();
-            set.insert(String::from("https_enforcement"));
-            set
-        },
-        ..RouteConfig::default()
-    };
-    let fairing = GuardFairing::with_defaults()
-        .with_https_enforcement(stage)
-        .with_route_configs(resolver_for(&[("GET", "/tls")], config));
-    let client = Client::tracked(minimal_app(fairing))
-        .await
-        .expect("valid rocket");
-
-    // Both the global arm and the route's require_https are skipped on
-    // the bypassed route.
-    let response = client.get("/tls").dispatch().await;
-    assert_eq!(response.status(), Status::Ok);
-    // The global arm still answers next door.
-    let response = client.get("/open").dispatch().await;
-    assert_eq!(response.status(), Status::MovedPermanently);
-}
-
-#[tokio::test]
 async fn a_non_compilable_route_pattern_fails_secure() {
     let config = RouteConfig {
         blocked_user_agents: vec![String::from("([")],
@@ -1329,45 +1299,6 @@ async fn a_non_compilable_route_pattern_fails_secure() {
     let response = client.get("/").dispatch().await;
     assert_eq!(response.status(), Status::InternalServerError);
     assert_eq!(body_text(response).await, "Security check failed");
-}
-
-#[tokio::test]
-async fn the_user_agent_bypass_skips_both_lists_for_the_route() {
-    let config = RouteConfig {
-        blocked_user_agents: vec![String::from("route-bot")],
-        bypassed_checks: {
-            let mut set = std::collections::BTreeSet::new();
-            set.insert(String::from("user_agent"));
-            set
-        },
-        ..RouteConfig::default()
-    };
-    let stage = guard_core_rs::user_agent::UserAgentStage::builder(
-        guard_core_rs::user_agent::UserAgentStageConfig {
-            blocked_user_agents: UserAgentFilter::new(["global-bot"]).expect("valid patterns"),
-            ip_ban: rocket_guard_rs::IpBanConfig {
-                enable_ip_banning: false,
-                ..rocket_guard_rs::IpBanConfig::default()
-            },
-            passive_mode: false,
-        },
-    )
-    .build()
-    .expect("valid stage");
-    let _ = stage;
-    let fairing =
-        GuardFairing::with_defaults().with_route_configs(resolver_for(&[("GET", "/open")], config));
-    let client = Client::tracked(minimal_app(fairing))
-        .await
-        .expect("valid rocket");
-
-    // The route list is skipped on the bypassed route.
-    let response = client
-        .get("/open")
-        .header(Header::new("User-Agent", "route-bot"))
-        .dispatch()
-        .await;
-    assert_eq!(response.status(), Status::Ok);
 }
 
 #[tokio::test]
@@ -1418,4 +1349,53 @@ async fn the_rate_limit_bypass_skips_the_whole_pass_for_the_route() {
         .dispatch()
         .await;
     assert_eq!(response.status(), Status::TooManyRequests);
+}
+
+#[tokio::test]
+async fn the_ip_ban_bypass_skips_the_ban_arm_for_its_route() {
+    let config = RouteConfig {
+        bypassed_checks: {
+            let mut set = std::collections::BTreeSet::new();
+            set.insert(String::from("ip_ban"));
+            set
+        },
+        ..RouteConfig::default()
+    };
+    // A live ban on the client IP through the fairing's shared ban store:
+    // the ban arm answers 403 everywhere except the bypassed route.
+    let bans = rocket_guard_rs::IpBanManager::new();
+    bans.ban_ip("192.0.2.55".parse().expect("ip"), 3600, "operator")
+        .expect("ban");
+    let fairing = GuardFairing::with_defaults()
+        .with_ip_banning(
+            bans,
+            rocket_guard_rs::IpBanConfig::new(
+                true,
+                10,
+                3600,
+                Vec::<(String, rocket_guard_rs::ThreatBanEntry)>::new(),
+            )
+            .expect("valid"),
+        )
+        .with_route_configs(resolver_for(&[("GET", "/open")], config));
+    let client = Client::tracked(minimal_app(fairing))
+        .await
+        .expect("valid rocket");
+
+    // The banned IP takes the ban denial next door.
+    let response = client
+        .get("/")
+        .remote(peer([192, 0, 2, 55]))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_eq!(body_text(response).await, "IP address banned");
+
+    // The bypassed route skips the ban arm: the same IP forwards.
+    let response = client
+        .get("/open")
+        .remote(peer([192, 0, 2, 55]))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
 }

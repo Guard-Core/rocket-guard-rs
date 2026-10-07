@@ -426,9 +426,8 @@ pub(crate) fn stage_decision(
 /// The ban arm alone (the reference `ip_security` ban check): the fairing's
 /// first stage pass, before the geo, cloud-provider, and user-agent checks.
 pub(crate) fn bans_decision(engine: &GuardEngine, request: &Request<'_>) -> Option<Verdict> {
-    // The reference `ip_security` bypass skips the ban arm (the fused
-    // `ip_security` block).
-    if carrier_bypasses(route_carrier(request).as_deref(), "ip_security") {
+    // The reference's ban-arm query (`ip_ban`) skips the ban arm.
+    if carrier_bypasses(route_carrier(request).as_deref(), "ip_ban") {
         return None;
     }
     let stage = engine.stage.as_ref()?;
