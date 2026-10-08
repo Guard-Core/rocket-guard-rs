@@ -1390,7 +1390,74 @@ impl GuardFairing {
             }
         }
 
+        // The reference `_check_route_ip_access` (inside the `ip_security`
+        // block, before the global lists): the route's `ip_whitelist` /
+        // `ip_blacklist` decide first - a configured whitelist takes over
+        // the route verdict (a match passes, a miss denies), then the
+        // blacklist denies. A configured whitelist also overrides the
+        // global IP lists for the request
+        // (`_route_overrides_ip_lists` / `skip_ip_lists`), so the global
+        // gate is skipped and the skip flags stay unset. An invalid list
+        // entry fails secure (the reference validates at decoration time;
+        // the carrier's invalid entry rides the family's fail-secure arm).
+        let mut skip_global_ip_lists = false;
         if !bypassed("ip")
+            && let Some(route) = route
+            && (route.ip_whitelist.is_some() || route.ip_blacklist.is_some())
+        {
+            match guard_core_engine::ip_gate::RouteIpGate::new(
+                route.ip_whitelist.iter().flatten().map(String::as_str),
+                route.ip_blacklist.iter().flatten().map(String::as_str),
+            ) {
+                Ok(gate) => {
+                    let verdict = request.client_ip().map_or(
+                        guard_core_engine::ip_gate::RouteIpVerdict::Unrestricted,
+                        |addr| gate.evaluate(addr),
+                    );
+                    if verdict == guard_core_engine::ip_gate::RouteIpVerdict::Denied {
+                        return crate::scan::stage_block(request, 403, crate::FORBIDDEN_MESSAGE);
+                    }
+                    skip_global_ip_lists = gate.whitelist_configured();
+                }
+                Err(_) => return Verdict::Failed,
+            }
+        }
+
+        // The route's country rules (`blocked_countries` /
+        // `whitelist_countries`, the reference `check_country_access`
+        // inside `_check_route_ip_access`): a route whitelist that passes
+        // also skips the global geo stage for the request
+        // (`skip_countries`). An unresolvable country blocks only under a
+        // restrictive route whitelist, exactly the engine's
+        // `check_countries` reading.
+        let mut skip_global_countries = false;
+        if !bypassed("ip")
+            && let Some(route) = route
+            && (route.blocked_countries.is_some() || route.whitelist_countries.is_some())
+        {
+            let route_gate = guard_core_engine::geo::parse_country_lists(
+                route
+                    .whitelist_countries
+                    .iter()
+                    .flatten()
+                    .map(String::as_str),
+                route.blocked_countries.iter().flatten().map(String::as_str),
+            );
+            if let (Some(addr), Some(handler)) = (request.client_ip(), self.geo_handler.as_ref()) {
+                if let Some(_block) = guard_core_engine::geo::check_countries(
+                    addr,
+                    &route_gate,
+                    handler.as_ref(),
+                    false,
+                ) {
+                    return crate::scan::stage_block(request, 403, crate::FORBIDDEN_MESSAGE);
+                }
+                skip_global_countries = !route_gate.whitelist_countries.is_empty();
+            }
+        }
+
+        if !bypassed("ip")
+            && !skip_global_ip_lists
             && let Some(gate) = &self.ip_gate
             && let Some(ip) = request.client_ip()
         {
@@ -1528,9 +1595,52 @@ impl GuardFairing {
         let path = request.uri().path().as_str();
         let method = request.method().as_str();
 
-        // Checks 6 + 7: required headers, then authentication (the fused
-        // stage answers for both; bypassing either reference check skips
-        // the whole stage).
+        // Checks 6 + 7: required headers, then authentication. The
+        // carrier's header and authentication rules (`required_headers`,
+        // `auth_required`, `authorization_header_required`, and the
+        // api-key group) evaluate through the engine's decision core -
+        // the same `headers_auth::decide` the fused stage runs - before
+        // the stage's own seam (the route wins first; a route without
+        // rules leaves the stage's own resolver authoritative).
+        if let Some(route) = route {
+            let rules = guard_core_engine::headers_auth::HeaderAuthRules {
+                required_headers: route
+                    .required_headers
+                    .iter()
+                    .map(
+                        |(name, expected)| guard_core_engine::headers_auth::RequiredHeader {
+                            name: name.clone(),
+                            expected: expected.clone(),
+                        },
+                    )
+                    .collect(),
+                auth_required: route.auth_required.clone(),
+                api_key_required: route.api_key_required,
+                api_key_header: route.api_key_header.clone(),
+                authorization_header_required: route.authorization_header_required.clone(),
+            };
+            if rules.has_rules() {
+                let verifiers = guard_core_engine::headers_auth::RouteVerifiers {
+                    auth: route.auth_verifier.clone(),
+                    api_key: route.api_key_verifier.clone(),
+                };
+                let pairs: Vec<(String, String)> = request
+                    .headers()
+                    .iter()
+                    .map(|header| (header.name().as_str().to_owned(), header.value().to_owned()))
+                    .collect();
+                if let Some(block) =
+                    guard_core_engine::headers_auth::decide(&rules, &verifiers, |name| {
+                        pairs
+                            .iter()
+                            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                            .map(|(_, value)| value.clone())
+                    })
+                {
+                    return crate::scan::stage_block(request, block.status, &block.body);
+                }
+            }
+        }
         if let Some(stage) = &self.headers_auth {
             let pairs: Vec<(String, String)> = request
                 .headers()
@@ -1546,7 +1656,31 @@ impl GuardFairing {
             }
         }
 
-        // Check 8: the route referrer gate.
+        // Check 8: the route referrer gate. The carrier's
+        // `require_referrer` list decides through the engine's referrer
+        // core before the stage's own seam (the route wins first).
+        if let Some(route) = route
+            && let Some(domains) = route.require_referrer.as_ref()
+        {
+            match guard_core_engine::referrer::decide(request.headers().get_one("referer"), domains)
+            {
+                guard_core_engine::referrer::ReferrerVerdict::Allowed => {}
+                guard_core_engine::referrer::ReferrerVerdict::Missing => {
+                    return crate::scan::stage_block(
+                        request,
+                        guard_core_engine::referrer::REFERRER_MISSING_STATUS,
+                        guard_core_engine::referrer::REFERRER_MISSING_BODY,
+                    );
+                }
+                guard_core_engine::referrer::ReferrerVerdict::Invalid { .. } => {
+                    return crate::scan::stage_block(
+                        request,
+                        guard_core_engine::referrer::REFERRER_INVALID_STATUS,
+                        guard_core_engine::referrer::REFERRER_INVALID_BODY,
+                    );
+                }
+            }
+        }
         if let Some(stage) = &self.referrer_gate
             && let Some(answer) = stage.decide(
                 path,
@@ -1560,7 +1694,38 @@ impl GuardFairing {
         }
 
         // Check 9: the route custom validators (first blocking response
-        // wins, the validator's own shape).
+        // wins, the validator's own shape). The carrier's
+        // `custom_validators` run through the engine's validator core
+        // before the stage's own seam; the carrier type is unnamed, so
+        // each lands under the reference's `"anonymous"` fallback.
+        if let Some(route) = route
+            && !route.custom_validators.is_empty()
+        {
+            let named: Vec<(String, guard_core_engine::custom_checks::CustomValidatorFn)> = route
+                .custom_validators
+                .iter()
+                .cloned()
+                .map(|validator| {
+                    (
+                        guard_core_engine::custom_checks::anonymous_name(),
+                        validator,
+                    )
+                })
+                .collect();
+            let ctx = guard_core_engine::custom_checks::CustomRequestContext {
+                method,
+                path,
+                client_ip: ip.is_some().then_some(ip_string.as_str()),
+                body: None,
+            };
+            if let guard_core_engine::custom_checks::CustomValidatorsVerdict::Failed {
+                block, ..
+            } = guard_core_engine::custom_checks::decide_custom_validators(&named, &ctx)
+            {
+                let status = block.and_then(|response| response.status).unwrap_or(200);
+                return crate::scan::stage_block(request, status, "");
+            }
+        }
         if let Some(stage) = &self.custom_checks
             // No body at this phase: Rocket's `on_request` never sees the
             // body (the data guard owns it), so the validators' body view
@@ -1577,7 +1742,31 @@ impl GuardFairing {
             return crate::scan::stage_block(request, status, "");
         }
 
-        // Check 10: the route time-window gate.
+        // Check 10: the route time-window gate. The carrier's
+        // `time_restrictions` dict (`start`, `end`, `timezone`) decides
+        // through the engine's time-window core before the stage's own
+        // seam; missing bounds read fail-open (the reference's `except`
+        // arm).
+        if let Some(route) = route
+            && let Some(restrictions) = route.time_restrictions.as_ref()
+        {
+            let window = guard_core_engine::time_window::TimeWindow {
+                start: restrictions.get("start").cloned(),
+                end: restrictions.get("end").cloned(),
+                timezone: restrictions.get("timezone").cloned(),
+            };
+            let current = guard_core_engine::time_window::hhmm_in_zone(
+                chrono::Utc::now(),
+                window.timezone.as_deref(),
+            );
+            if !guard_core_engine::time_window::is_within(&window, &current) {
+                return crate::scan::stage_block(
+                    request,
+                    guard_core_engine::time_window::TIME_WINDOW_BLOCK_STATUS,
+                    guard_core_engine::time_window::TIME_WINDOW_BLOCK_BODY,
+                );
+            }
+        }
         if let Some(stage) = &self.time_window_gate
             && let Some(answer) = stage.decide(path, &ip_string, path, method)
         {
@@ -1593,7 +1782,14 @@ impl GuardFairing {
         // The reference `suspicious_activity` bypass skips the scan for
         // the route; the global `enable_penetration_detection` toggle
         // skips it everywhere (the request proceeds clean).
-        let metadata = if bypassed("penetration") || !self.penetration_detection_enabled {
+        // The route's `enable_suspicious_detection` toggle overrides the
+        // default for its route only (the reference decorator's detection
+        // toggle, the `detection_enabled` resolution).
+        let metadata = if bypassed("penetration")
+            || !guard_core_engine::detection_exclusions::detection_enabled(
+                self.penetration_detection_enabled,
+                route.map(|route| route.enable_suspicious_detection),
+            ) {
             None
         } else {
             match catch_unwind(AssertUnwindSafe(|| engine.scan_metadata(request))) {
@@ -1627,8 +1823,10 @@ impl GuardFairing {
             );
         }
         // The reference runs the country arms inside the `ip`-gated
-        // block: the same bypass skips the geo stage.
+        // block: the same bypass skips the geo stage, and a passing route
+        // country whitelist skips it too (`skip_countries`).
         if !bypassed("ip")
+            && !skip_global_countries
             && let Some(stage) = &self.geo_blocking
             && let Some(decision) = stage.decide(ip, gate)
         {
@@ -2165,6 +2363,570 @@ mod tests {
         // path answers the router's own 404 (the route-inventory shield).
         let response = client.options("/hello").dispatch().await;
         assert_eq!(response.status(), Status::NotFound);
+    }
+
+    // --- the carrier's stage knobs (the reference RouteConfig reads at
+    // the per-stage seams), end to end through the public API ---
+
+    /// A static geolocation for the carrier lanes: every IP maps to `DE`.
+    struct RouteStaticGeo;
+
+    impl guard_core_engine::geo::GeoIpHandler for RouteStaticGeo {
+        fn get_country(&self, _ip: std::net::IpAddr) -> Option<String> {
+            Some(String::from("DE"))
+        }
+    }
+
+    fn route_resolver_for(
+        paths: &[(&str, &str)],
+        config: crate::RouteConfig,
+    ) -> guard_core_engine::route_config::RouteConfigResolver {
+        let owned: Vec<(String, String)> = paths
+            .iter()
+            .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+            .collect();
+        std::sync::Arc::new(move |method: &str, path: &str| {
+            owned
+                .iter()
+                .any(|(route_method, route_path)| route_method == method && route_path == path)
+                .then(|| std::sync::Arc::new(config.clone()))
+        })
+    }
+
+    fn minutes_to_hhmm(minutes: i64) -> String {
+        let minutes = minutes.rem_euclid(24 * 60);
+        format!("{:02}:{:02}", minutes / 60, minutes % 60)
+    }
+
+    #[tokio::test]
+    async fn route_ip_whitelist_overrides_the_global_lists() {
+        // The global gate blacklists the address; the route's whitelist
+        // takes over for its route (the match passes, the global deny is
+        // skipped) and misses deny with the reference Forbidden shape.
+        let gate = IpGateConfig::new(NIL, ["203.0.113.9"], NIL).expect("valid lists");
+        let config = crate::RouteConfig {
+            ip_whitelist: Some(vec![String::from("203.0.113.9")]),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_ip_gate(gate)
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([203, 0, 113, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the route whitelist match passes"
+        );
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 5], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "the route whitelist miss denies"
+        );
+        // The whitelist overrides the global lists for its route only.
+        let response = client
+            .get("/nope")
+            .remote(std::net::SocketAddr::from(([203, 0, 113, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "the global gate holds off-route"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_ip_blacklist_denies_its_route_only() {
+        let config = crate::RouteConfig {
+            ip_blacklist: Some(vec![String::from("192.0.2.6")]),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 6], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, crate::FORBIDDEN_MESSAGE);
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 5], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "a non-listed address passes");
+        let response = client
+            .get("/nope")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 6], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::NotFound,
+            "off the route it holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_route_ip_list_entry_fails_secure() {
+        let config = crate::RouteConfig {
+            ip_whitelist: Some(vec![String::from("not-an-ip")]),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 5], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::InternalServerError);
+    }
+
+    #[tokio::test]
+    async fn route_blocked_countries_block_their_route_only() {
+        let config = crate::RouteConfig {
+            blocked_countries: Some(vec![String::from("DE")]),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_geo_handler(std::sync::Arc::new(RouteStaticGeo))
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden, "DE is route-blocked");
+        let response = client
+            .get("/nope")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NotFound);
+    }
+
+    #[tokio::test]
+    async fn route_country_whitelist_skips_the_global_geo_stage() {
+        let config = crate::RouteConfig {
+            whitelist_countries: Some(vec![String::from("DE")]),
+            ..crate::RouteConfig::default()
+        };
+        let global_geo =
+            guard_core_rs::geo::GeoStage::builder(guard_core_rs::geo::GeoStageConfig {
+                gate: guard_core_engine::geo::parse_country_lists(NIL, ["DE"]),
+                handler: Some(std::sync::Arc::new(RouteStaticGeo)),
+                passive_mode: false,
+            })
+            .build();
+        let fairing = GuardFairing::with_defaults()
+            .with_geo_blocking(global_geo)
+            .with_geo_handler(std::sync::Arc::new(RouteStaticGeo))
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the route whitelist match passes"
+        );
+        let response = client
+            .get("/nope")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "the global geo stage holds off-route"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_country_rules_without_a_geo_handler_pass() {
+        let config = crate::RouteConfig {
+            whitelist_countries: Some(vec![String::from("DE")]),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn route_required_headers_demand_their_headers() {
+        let config = crate::RouteConfig {
+            required_headers: [
+                (String::from("X-Request-ID"), String::from("required")),
+                (String::from("X-Tenant"), String::from("acme")),
+            ]
+            .into_iter()
+            .collect(),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Missing required header: X-Request-ID");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("X-Request-ID", "abc"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Missing required header: X-Tenant");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("X-Request-ID", "abc"))
+            .header(rocket::http::Header::new("X-Tenant", "other"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Header 'X-Tenant' does not match the required value");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("X-Request-ID", "abc"))
+            .header(rocket::http::Header::new("X-Tenant", "acme"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let response = client.get("/nope").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::NotFound,
+            "the unlisted path is unguarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_auth_required_demands_the_scheme() {
+        let config = crate::RouteConfig {
+            auth_required: Some(String::from("bearer")),
+            auth_verifier: Some(std::sync::Arc::new(|credential: &str| {
+                credential == "token-1"
+            })),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Authentication required");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("Authorization", "Bearer token-1"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "the verifier accepts");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("Authorization", "Bearer other"))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Unauthorized,
+            "the verifier rejects"
+        );
+        let response = client.get("/nope").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::NotFound,
+            "the unlisted path is unguarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_api_key_group_reads_its_header() {
+        let config = crate::RouteConfig {
+            api_key_required: true,
+            api_key_header: Some(String::from("X-Key")),
+            api_key_verifier: Some(std::sync::Arc::new(|credential: &str| {
+                credential == "secret"
+            })),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Authentication required");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("X-Key", "secret"))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the verifier accepts the key"
+        );
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("X-Key", "wrong"))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Unauthorized,
+            "the verifier rejects"
+        );
+        let response = client.get("/nope").dispatch().await;
+        assert_eq!(response.status(), Status::NotFound);
+    }
+
+    #[tokio::test]
+    async fn route_custom_validator_verdicts() {
+        let validator: guard_core_engine::custom_checks::CustomValidatorFn = std::sync::Arc::new(
+            |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
+                (ctx.path == "/hello").then_some(
+                    guard_core_engine::custom_checks::ValidatorAnswer::Response(
+                        guard_core_engine::custom_checks::CustomResponse {
+                            status: Some(418),
+                            body: None,
+                        },
+                    ),
+                )
+            },
+        );
+        let config = crate::RouteConfig {
+            custom_validators: vec![validator],
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::ImATeapot,
+            "the validator's status wins"
+        );
+
+        // The truthy non-response and the declining validator never block.
+        let truthy: guard_core_engine::custom_checks::CustomValidatorFn =
+            std::sync::Arc::new(|_ctx| {
+                Some(guard_core_engine::custom_checks::ValidatorAnswer::TruthyNonResponse)
+            });
+        let config = crate::RouteConfig {
+            custom_validators: vec![truthy],
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the truthy non-response passes"
+        );
+
+        let declining: guard_core_engine::custom_checks::CustomValidatorFn =
+            std::sync::Arc::new(|_ctx| None);
+        let config = crate::RouteConfig {
+            custom_validators: vec![declining],
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the declining validator passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_require_referrer_gates_its_route() {
+        let config = crate::RouteConfig {
+            require_referrer: Some(vec![String::from("partner.example.com")]),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Referrer required");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new(
+                "Referer",
+                "https://evil.example.net/x",
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Invalid referrer");
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new(
+                "Referer",
+                "https://partner.example.com/x",
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let response = client.get("/nope").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::NotFound,
+            "the unlisted path is unguarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_time_restrictions_gate_their_route() {
+        use chrono::Timelike;
+        let now = chrono::Utc::now();
+        let now_minutes = i64::from(now.hour() * 60 + now.minute());
+        let (late_start, late_end) = (now_minutes + 5, now_minutes + 10);
+        let (early_start, early_end) = (now_minutes - 15, now_minutes - 10);
+        let blocked = crate::RouteConfig {
+            time_restrictions: Some(
+                [
+                    (String::from("start"), minutes_to_hhmm(late_start)),
+                    (String::from("end"), minutes_to_hhmm(late_end)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], blocked));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "now is outside the window"
+        );
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Access not allowed at this time");
+        let response = client.get("/nope").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::NotFound,
+            "the window holds on its route"
+        );
+
+        let early = crate::RouteConfig {
+            time_restrictions: Some(
+                [
+                    (String::from("start"), minutes_to_hhmm(early_start)),
+                    (String::from("end"), minutes_to_hhmm(early_end)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], early));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "the early span blocks"
+        );
+
+        let passing = crate::RouteConfig {
+            time_restrictions: Some(
+                [
+                    (String::from("start"), minutes_to_hhmm(now_minutes - 2)),
+                    (String::from("end"), minutes_to_hhmm(now_minutes + 2)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], passing));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Ok, "now is inside the window");
+
+        // Missing bounds read fail-open (the reference's except arm).
+        let fail_open = crate::RouteConfig {
+            time_restrictions: Some(
+                [(String::from("start"), String::from("09:00"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], fail_open));
+        let client = tracked(fairing).await;
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "a malformed dict reads fail-open"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_enable_suspicious_detection_false_skips_the_scan() {
+        let config = crate::RouteConfig {
+            enable_suspicious_detection: false,
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .header(rocket::http::Header::new("X-Probe", "$(whoami)"))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the scan is off on its route"
+        );
     }
 
     #[tokio::test]
