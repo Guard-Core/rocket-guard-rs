@@ -2,8 +2,8 @@
 
 `rocket-guard-rs` is application-layer security middleware for
 [Rocket](https://rocket.rs) 0.5, powered by the
-[guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine.
-It is part of the [Guard ecosystem](https://github.com/rennf93).
+[guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine.
+It is part of the [Guard ecosystem](https://github.com/Guard-Core).
 
 The crate holds framework glue only: every detection decision comes from the
 engine. [`GuardFairing`](api.md#guardfairing) screens every request through

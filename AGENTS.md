@@ -3,9 +3,9 @@ Guidance for AI agents (including Claude Code) working in this repository.
 
 ## Project Overview
 
-rocket-guard-rs is the Rocket adapter for the Guard ecosystem. It screens Rocket 0.5 traffic through the [guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine: [`GuardFairing`](src/fairing.rs) scans path, query, and header views in `on_request` and stashes the verdict in request-local state, and per-route request guards ([`BlockGuard`](src/guards.rs) for bodyless routes, [`GuardBody`](src/guards.rs) for routes with a body) enforce the verdict before a handler runs. It contains no security logic of its own.
+rocket-guard-rs is the Rocket adapter for the Guard ecosystem. It screens Rocket 0.5 traffic through the [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine: [`GuardFairing`](src/fairing.rs) scans path, query, and header views in `on_request` and stashes the verdict in request-local state, and per-route request guards ([`BlockGuard`](src/guards.rs) for bodyless routes, [`GuardBody`](src/guards.rs) for routes with a body) enforce the verdict before a handler runs. It contains no security logic of its own.
 
-- **Repository**: https://github.com/rennf93/rocket-guard-rs
+- **Repository**: https://github.com/Guard-Core/rocket-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
 - **Version**: 1.2.0 (published to crates.io)
@@ -59,7 +59,7 @@ The method is not scanned: `detect` has no method parameter. Non-UTF-8 header va
 - `Cargo.toml` pins `guard-core-engine` and `guard-core-rs` at 4.2.0 with paths into the sibling checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`).
 - Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so 1.1.0 could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`rocket-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0).
 - The engine crate is used directly for `detect`; the facade dependency supplies the pipeline-side modules (events, geo, cloud provider, responses, and the rate-limit/ban stage wiring). The facade re-exports the full engine stage set since 4.1.0.
-- CI checks out `rennf93/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
+- CI checks out `Guard-Core/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
 
 ## Development Commands
 
@@ -143,7 +143,7 @@ rocket-guard-rs/
 
 ## Related Projects
 
-- [guard-core-rs](https://github.com/rennf93/guard-core-rs): Rust detection engine (this crate's dependency).
-- Sibling adapters: [tower-guard-rs](https://github.com/rennf93/tower-guard-rs), [axum-guard-rs](https://github.com/rennf93/axum-guard-rs), [actix-guard-rs](https://github.com/rennf93/actix-guard-rs).
-- [guard-core](https://github.com/rennf93/guard-core): Python reference implementation and spec owner (spec 4.1.0).
-- [fastapi-guard](https://github.com/rennf93/fastapi-guard): the most mature adapter in the ecosystem, a useful reference for feature coverage.
+- [guard-core-rs](https://github.com/Guard-Core/guard-core-rs): Rust detection engine (this crate's dependency).
+- Sibling adapters: [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs), [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs), [actix-guard-rs](https://github.com/Guard-Core/actix-guard-rs).
+- [guard-core](https://github.com/Guard-Core/guard-core): Python reference implementation and spec owner (spec 4.1.0).
+- [fastapi-guard](https://github.com/Guard-Core/fastapi-guard): the most mature adapter in the ecosystem, a useful reference for feature coverage.

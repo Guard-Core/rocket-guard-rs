@@ -16,12 +16,12 @@ We take the security of Rocket Guard seriously. If you believe you've found a se
 
 1. **Do not disclose the vulnerability publicly** until it has been addressed by the maintainers.
 2. **Report the vulnerability through GitHub's security advisory feature**:
-   - Go to the [Security tab](https://github.com/rennf93/rocket-guard-rs/security/advisories) of the Rocket Guard repository
+   - Go to the [Security tab](https://github.com/Guard-Core/rocket-guard-rs/security/advisories) of the Rocket Guard repository
    - Click on "New draft security advisory"
    - Fill in the details of the vulnerability
    - Submit the advisory
 
-   Alternatively, you can report vulnerabilities through [GitHub's private vulnerability reporting feature](https://github.com/rennf93/rocket-guard-rs/security/advisories/new).
+   Alternatively, you can report vulnerabilities through [GitHub's private vulnerability reporting feature](https://github.com/Guard-Core/rocket-guard-rs/security/advisories/new).
 
 3. Include the following information in your report:
    - A description of the vulnerability and its potential impact
