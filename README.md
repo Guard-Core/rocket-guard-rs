@@ -145,9 +145,11 @@ A body larger than the cap is rejected with `413` rather than forwarded unscanne
 
 `status::GuardStatus` in managed state plus the `status::guard_status` route handler is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): `.manage(GuardStatus::new().with_cloud_table(table)).mount(status::DEFAULT_STATUS_PATH, routes![guard_status])` mounts `GET /_guard/status`, serving the cloud-provider readiness table (`{"ready":...}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with one). The Rust engine tracks cloud readiness only, so the `entries`/`last_refreshed` keys the Python family serves have no counterpart here; the payload is rendered per request from in-memory state with no dependency added.
 
-## WebSocket upgrades
+## WebSocket guard (rocket_ws)
 
-WebSocket upgrades are not guarded by this adapter: Rocket 0.5 has no stable WebSocket surface (no upgrade interception point in the fairing/request-guard model this adapter is built on, and no first-party WS support to hang one on). The guard exists where the framework exposes the upgrade: axum applications use [`axum-guard-rs`](https://github.com/rennf93/axum-guard-rs)'s `websocket::WebSocketGuard` and actix Web applications use `actix-guard-rs`'s `websocket::WebSocketGuard` (1008 policy / 1013 try-again-later close semantics, 403 pre-accept, the fastapi-guard `guard/websocket.py` sequence). Plain requests still pass through the fairing + guard split as always.
+Rocket 0.5's WebSocket surface is the official [`rocket_ws`](https://crates.io/crates/rocket_ws) crate, and `websocket::WebSocketGuard` guards it, ported from fastapi-guard's `guard/websocket.py` (`make_guard_websocket`): install the guard with `.manage(make_guard_websocket(config))` and declare it on the `rocket_ws` routes it protects. A blocked handshake is rejected with `403 Forbidden` pre-accept, carrying the close shape on `x-guard-websocket-close` / `x-guard-websocket-close-reason` (Starlette's `WebSocketException` denial, translated like the axum/actix siblings). The close codes are the reference's: `1008 Policy Violation` for every policy denial (IP banned, IP not allowed, rate limit exceeded, unknown client address under fail-secure, suspicious activity) and `1013 Try Again Later` for an engine malfunction (a panic in the check sequence, contained). The sequence: fail-secure unknown address, the ban arm, the `is_ip_allowed` gate + country arms (a whitelist match skips countries), the `ws` rate limit (skipped for whitelisted IPs), then the path/query/header penetration scan - an upgrade carries no body.
+
+Frames after the upgrade are guarded too: `WebSocketGuard::scan_frame(client_ip, &message)` scans one text or binary message through the engine, feeds the shared violation store on a threat, and reports the close shape the channel answers with (`WebSocketGuard::close_frame` + `stream_error`); control frames pass untouched. `WebSocketGuardConfig::with_violation_feed(ViolationFeed::new(counters, ban_config))` installs the shared-suspicious-counts store (the reference's shared `suspicious_request_counts`): a crossed threshold bans the address through the shared `IpBanManager`, and the next handshake's ban arm then rejects it - frame threats close the current connection with the suspicious-activity close exactly like the reference's single detection arm. Build the config from the handles the app already holds with `WebSocketGuardConfig::new(default_config())` + the `with_ip_gate` / `with_ip_banning` / `with_rate_limiting` / `with_country_rules` / `with_violation_feed` / `with_fail_secure` builders. The fairing itself passes upgrades through like any request; the guard is the per-route surface Rocket's model requires.
 
 ## Engine dependency
 
@@ -161,8 +163,7 @@ Every reference check the engine ships is installable on `GuardFairing`, and the
 
 ## Not wired on purpose
 
-- **WebSocket guard**: a `rocket_ws` route's upgrade handshake passes through the fairing like any request; frames after the upgrade are not intercepted. There is no per-frame guard surface.
-- **Status route**: no `add_status_route` equivalent ships (a gap tracked family-wide); expose engine state through your own route if you need it.
+- **WebSocket guard (fairing half)**: the fairing scans an upgrade's path, query, and header views like any request, but the handshake rejection and the per-frame guard live in the `websocket::WebSocketGuard` route surface, not the fairing; a `rocket_ws` route without the guard argument is not WS-guarded.
 
 ## Development
 
