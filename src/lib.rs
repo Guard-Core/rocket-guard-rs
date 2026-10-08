@@ -181,6 +181,7 @@ mod response;
 mod scan;
 
 pub mod status;
+pub mod websocket;
 
 pub use crate::fairing::GuardFairing;
 pub use crate::guards::{BlockGuard, GuardBody, GuardBodyError};
@@ -189,6 +190,10 @@ pub use crate::response::{
     OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, guard_catchers,
 };
 pub use crate::scan::{set_route_config, set_route_detection_exclusions, set_route_rate_limits};
+pub use crate::websocket::{
+    WebSocketCloseReason, WebSocketGuard, WebSocketGuardConfig, WsGuardError, make_guard_websocket,
+    run_websocket_checks,
+};
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
 pub use guard_core_engine::detection_exclusions::{
     DetectionExclusionConfig, RouteDetectionExclusions,
