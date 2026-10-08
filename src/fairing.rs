@@ -1837,15 +1837,44 @@ impl GuardFairing {
             );
         }
 
-        if !bypassed("clouds")
-            && let Some(stage) = &self.cloud_provider
-            && let Some(decision) = stage.decide(ip, gate)
-        {
-            return crate::scan::stage_block(
-                request,
-                decision.answer.status.as_u16(),
-                stage_answer_body(&decision.answer),
-            );
+        // The reference `get_cloud_providers_to_check` route-over-global
+        // resolution: the route's `block_cloud_providers` list replaces
+        // the global one for the request (an empty route list falls back
+        // to the global config); an invalid route selector fails secure
+        // (the reference validates at decoration time).
+        if !bypassed("clouds") {
+            let route_selectors = route
+                .filter(|route| !route.block_cloud_providers.is_empty())
+                .map(|route| {
+                    guard_core_engine::cloud_provider::parse_cloud_selectors(
+                        route.block_cloud_providers.iter().map(String::as_str),
+                    )
+                });
+            match route_selectors {
+                Some(Ok(selectors)) => {
+                    if let Some(stage) = &self.cloud_provider
+                        && let Some(decision) = stage.decide_route(ip, gate, &selectors)
+                    {
+                        return crate::scan::stage_block(
+                            request,
+                            decision.answer.status.as_u16(),
+                            stage_answer_body(&decision.answer),
+                        );
+                    }
+                }
+                Some(Err(_)) => return Verdict::Failed,
+                None => {
+                    if let Some(stage) = &self.cloud_provider
+                        && let Some(decision) = stage.decide(ip, gate)
+                    {
+                        return crate::scan::stage_block(
+                            request,
+                            decision.answer.status.as_u16(),
+                            stage_answer_body(&decision.answer),
+                        );
+                    }
+                }
+            }
         }
 
         let finding = metadata
@@ -2982,6 +3011,159 @@ mod tests {
         assert_eq!(response.status(), Status::Forbidden);
         let body = response.into_string().await.unwrap_or_default();
         assert_eq!(body, crate::ACTIVITY_BANNED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn route_cloud_provider_list_resolves_over_the_global() {
+        // The RC2 route-over-global resolution: the route's GCP list
+        // replaces the global AWS list for its route, an AWS route list
+        // blocks, an empty route list falls back to the global config, an
+        // invalid selector fails secure, and the off-route path takes the
+        // global lane.
+        fn route_cloud_fairing(route_providers: &[&str]) -> GuardFairing {
+            let table = guard_core_engine::cloud_provider::CloudIpTable::default();
+            table
+                .set_provider_ranges("AWS", vec![("192.0.2.0/24".to_owned(), None)])
+                .expect("valid ranges");
+            table
+                .set_provider_ranges("GCP", vec![("198.51.100.0/24".to_owned(), None)])
+                .expect("valid ranges");
+            let cloud = guard_core_rs::cloud_provider::CloudProviderStage::builder(
+                guard_core_rs::cloud_provider::CloudProviderStageConfig {
+                    block_cloud_providers: guard_core_rs::cloud_provider::parse_cloud_selectors([
+                        "AWS",
+                    ])
+                    .expect("valid selectors"),
+                    table,
+                    passive_mode: false,
+                },
+            )
+            .build();
+            let config = crate::RouteConfig {
+                block_cloud_providers: route_providers
+                    .iter()
+                    .map(|provider| (*provider).to_owned())
+                    .collect(),
+                ..crate::RouteConfig::default()
+            };
+            GuardFairing::with_defaults()
+                .with_cloud_provider(cloud)
+                .with_route_configs(route_resolver_for(&[("GET", "/hello")], config))
+        }
+
+        {
+            let client = tracked(route_cloud_fairing(&["GCP"])).await;
+            let response = client
+                .get("/hello")
+                .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(
+                response.status(),
+                Status::Ok,
+                "the route list overrides the global"
+            );
+            let response = client
+                .get("/hello")
+                .remote(std::net::SocketAddr::from(([198, 51, 100, 9], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(
+                response.status(),
+                Status::Forbidden,
+                "the route list blocks"
+            );
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(body, "Cloud provider IP not allowed");
+            let response = client
+                .get("/nope")
+                .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(
+                response.status(),
+                Status::Forbidden,
+                "the global list holds off-route"
+            );
+        }
+        {
+            let client = tracked(route_cloud_fairing(&["AWS"])).await;
+            let response = client
+                .get("/hello")
+                .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Forbidden);
+        }
+        {
+            let client = tracked(route_cloud_fairing(&[])).await;
+            let response = client
+                .get("/hello")
+                .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(
+                response.status(),
+                Status::Forbidden,
+                "the empty route list falls back"
+            );
+        }
+        {
+            let client = tracked(route_cloud_fairing(&["Hetzner"])).await;
+            let response = client
+                .get("/hello")
+                .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(
+                response.status(),
+                Status::InternalServerError,
+                "fails secure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_clouds_bypass_skips_the_route_lane_and_the_global_lane() {
+        // The `clouds` bypass skips the whole arm: the matching address
+        // passes with the stage installed.
+        let table = guard_core_engine::cloud_provider::CloudIpTable::default();
+        table
+            .set_provider_ranges("AWS", vec![("192.0.2.0/24".to_owned(), None)])
+            .expect("valid ranges");
+        let cloud = guard_core_rs::cloud_provider::CloudProviderStage::builder(
+            guard_core_rs::cloud_provider::CloudProviderStageConfig {
+                block_cloud_providers: guard_core_rs::cloud_provider::parse_cloud_selectors([
+                    "AWS",
+                ])
+                .expect("valid selectors"),
+                table,
+                passive_mode: false,
+            },
+        )
+        .build();
+        let config = crate::RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("clouds"));
+                set
+            },
+            ..crate::RouteConfig::default()
+        };
+        let fairing = GuardFairing::with_defaults()
+            .with_cloud_provider(cloud)
+            .with_route_configs(route_resolver_for(&[("GET", "/hello")], config));
+        let client = tracked(fairing).await;
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 9], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the clouds bypass skips the arm"
+        );
     }
 
     #[tokio::test]
