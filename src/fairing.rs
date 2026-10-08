@@ -3157,6 +3157,51 @@ mod stateful_tests {
     }
 
     #[tokio::test]
+    async fn the_penetration_detection_toggle_skips_the_body_scan() {
+        // The body phase gates on the same toggle: a POST whose body
+        // carries the attack rides through clean with the toggle off,
+        // and blocks under the default.
+        let config = SecurityConfig {
+            enable_penetration_detection: false,
+            ..SecurityConfig::default()
+        };
+        let client = Client::tracked(
+            rocket::build()
+                .attach(GuardFairing::from_security_config(&config).expect("valid"))
+                .mount("/", routes![echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .post("/echo")
+            .remote(peer("203.0.113.9"))
+            .body(r#"{"q": "1 UNION SELECT password"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the toggle disables the body scan"
+        );
+
+        let client = Client::tracked(
+            rocket::build()
+                .attach(
+                    GuardFairing::from_security_config(&SecurityConfig::default()).expect("valid"),
+                )
+                .mount("/", routes![echo]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .post("/echo")
+            .remote(peer("203.0.113.9"))
+            .body(r#"{"q": "1 UNION SELECT password"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+    }
+    #[tokio::test]
     async fn the_penetration_detection_toggle_skips_the_scan() {
         // `enable_penetration_detection = false` skips the multi-surface
         // scan entirely: the attack rides through clean (200).
