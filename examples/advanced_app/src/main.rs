@@ -73,6 +73,9 @@ fn admin_stats(_guard: BlockGuard) -> &'static str {
 /// | `GUARD_SEMANTIC_THRESHOLD` | `semantic_threshold` | `0.7` |
 /// | `GUARD_THREAT_SCORE_THRESHOLD` | `threat_score_threshold` | `1.0` |
 /// | `GUARD_BINARY_MIN_RUN_LENGTH` | `binary_min_run_length` | `16` |
+/// | `GUARD_MAX_SCAN_VALUES` | `max_scan_values` | `512` |
+/// | `GUARD_MAX_SCAN_CHARS` | `max_scan_chars` | `65536` |
+/// | `GUARD_MAX_JSON_DEPTH` | `max_json_depth` | `32` |
 fn env_config() -> rocket_guard_rs::DetectConfig {
     let defaults = default_config();
     rocket_guard_rs::DetectConfig {
@@ -91,6 +94,9 @@ fn env_config() -> rocket_guard_rs::DetectConfig {
             "GUARD_BINARY_MIN_RUN_LENGTH",
             defaults.binary_min_run_length,
         ),
+        max_scan_values: env_usize("GUARD_MAX_SCAN_VALUES", defaults.max_scan_values),
+        max_scan_chars: env_usize("GUARD_MAX_SCAN_CHARS", defaults.max_scan_chars),
+        max_json_depth: env_usize("GUARD_MAX_JSON_DEPTH", defaults.max_json_depth),
     }
 }
 
