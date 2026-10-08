@@ -660,8 +660,15 @@ impl GuardFairing {
 
     /// Install the [`SecurityEventBus`] the stage's security events
     /// dispatch through (`penetration_attempt`, `rate_limited`,
-    /// `ip_banned`, with the reference fields and metadata). Handlers
-    /// receive every event and own the transport.
+    /// `ip_banned`, with the reference fields and metadata). The
+    /// response-side pass joins the stream: when the security-header set
+    /// lands on a forwarded response (the pipeline passed and no guard
+    /// refused), the composed `security_headers_applied` event (action
+    /// `headers_added`, the display-redacted path plus
+    /// `headers_count`/`has_csp`/`has_hsts`) dispatches too;
+    /// guard-generated answers apply the headers without firing (the
+    /// reference's `create_error_response` lane). Handlers receive every
+    /// event and own the transport.
     #[must_use]
     pub fn with_event_bus(mut self, bus: Arc<SecurityEventBus>) -> Self {
         self.events = Some(bus);
@@ -1169,6 +1176,7 @@ impl Fairing for GuardFairing {
             };
             let _action =
                 processor.process(&request_bits, &mut bits, None, std::time::SystemTime::now());
+            self.emit_headers_applied_event(processor, request);
 
             // The reference `custom_response_modifier`: the callback runs
             // LAST over the response view. A panicking callback restores
@@ -1212,6 +1220,45 @@ fn client_ip_string(client_ip: Option<std::net::IpAddr>) -> String {
 }
 
 impl GuardFairing {
+    /// The `security_headers_applied` funnel: when the security-header set
+    /// lands on a forwarded response and a bus is installed, the composed
+    /// event (the reference `_send_headers_applied_event`, the #103
+    /// composer) dispatches with the exact set the pass rendered - the
+    /// count and the CSP/HSTS flags from the resolved config (the #104
+    /// accessor), before the CORS verdict and the response modifier touch
+    /// the view.
+    ///
+    /// Only the forwarded lane fires: the request passed the pipeline
+    /// (`Verdict::Clean`) and no route guard refused it, the reference
+    /// `process_response` shape that carries the request path. The guard
+    /// answers (blocks, the redirect, the fail-secure `500`) apply the
+    /// headers without firing - the reference `create_error_response`
+    /// lane, where the event sits behind the request path. A disabled
+    /// config and an absent bus each stay silent.
+    fn emit_headers_applied_event(&self, processor: &ResponseProcessor, request: &Request<'_>) {
+        if metadata_verdict(request) != Some(Verdict::Clean)
+            || crate::scan::enforced_verdict(request).is_some()
+        {
+            return;
+        }
+        let Some(config) = processor.security_headers().filter(|config| config.enabled) else {
+            return;
+        };
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let set = guard_core_engine::security_headers::security_headers(config);
+        bus.send_event(
+            &guard_core_rs::stage_events::security_headers_applied_event(
+                request.uri().path().as_str(),
+                set.len(),
+                set.contains_key("Content-Security-Policy"),
+                set.contains_key("Strict-Transport-Security"),
+                &client_ip_string(request.client_ip()),
+            ),
+        );
+    }
+
     /// The request's verdict: the IP gate first (a denied client IP is the
     /// verdict, no scan needed), then the reference pipeline's stages in
     /// order (emergency mode, HTTPS enforcement, request logging, required
@@ -2964,6 +3011,192 @@ mod stateful_tests {
                 && event.handler_name.as_deref() == Some("rate_limit")),
             "the rate_limited event fired: {events:?}"
         );
+    }
+
+    fn recording_bus(
+        sink: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>>,
+    ) -> Arc<guard_core_rs::events::SecurityEventBus> {
+        Arc::new(
+            guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(move |event| {
+                sink.lock().expect("events").push(event.clone());
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_forwarded_lane_dispatches_the_headers_applied_event() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(bare_processor())
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.96").await;
+        assert_eq!(status, Status::Ok);
+        let events = events.lock().expect("events");
+        let applied: Vec<&guard_core_rs::events::SecurityEvent> = events
+            .iter()
+            .filter(|event| event.event_type == "security_headers_applied")
+            .collect();
+        assert_eq!(
+            applied.len(),
+            1,
+            "one event per forwarded response: {events:?}"
+        );
+        let event = applied[0];
+        assert_eq!(event.action_taken, "headers_added");
+        assert_eq!(event.handler_name.as_deref(), Some("security_headers"));
+        assert_eq!(event.ip_address, "192.0.2.96");
+        assert_eq!(event.metadata["path"].as_str(), Some("/hello"));
+        // The count is the rendered security-header set (the reference
+        // default carries HSTS and no CSP), not a CORS- or
+        // modifier-extended view.
+        let set = guard_core_engine::security_headers::security_headers(
+            &guard_core_engine::security_headers::SecurityHeadersConfig::reference_default(),
+        );
+        assert_eq!(
+            event.metadata["headers_count"].as_u64(),
+            Some(set.len() as u64)
+        );
+        assert_eq!(event.metadata["has_csp"].as_bool(), Some(false));
+        assert_eq!(event.metadata["has_hsts"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_csp_bearing_config_flips_the_flag_and_grows_the_count() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let with_csp = guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig {
+                csp: vec![guard_core_engine::security_headers::CspDirective {
+                    name: "default-src".to_owned(),
+                    sources: vec!["'self'".to_owned()],
+                }],
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            }),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        );
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(with_csp)
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.97").await;
+        assert_eq!(status, Status::Ok);
+        let events = events.lock().expect("events");
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "security_headers_applied")
+            .expect("the CSP event fired");
+        assert_eq!(event.metadata["has_csp"].as_bool(), Some(true));
+        let set = guard_core_engine::security_headers::security_headers(
+            &guard_core_engine::security_headers::SecurityHeadersConfig::reference_default(),
+        );
+        assert_eq!(
+            event.metadata["headers_count"].as_u64(),
+            Some((set.len() + 1) as u64),
+            "the CSP header joins the set"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_generated_lane_applies_headers_without_the_event() {
+        // A guard block answers with the security-header set (the
+        // reference `create_error_response` applies the headers) but
+        // fires no event: that lane passes no request path. The first
+        // (forwarded) request pins the positive control: the bus is
+        // wired and the funnel fired exactly once for it.
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(bare_processor())
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        let (status, _, _) = full_status(fairing.clone(), "/hello", "192.0.2.98").await;
+        assert_eq!(status, Status::Ok);
+        let (status, _, _) = attack_status(fairing, "192.0.2.98").await;
+        assert_eq!(status, Status::BadRequest);
+        let events = events.lock().expect("events");
+        let applied: Vec<&guard_core_rs::events::SecurityEvent> = events
+            .iter()
+            .filter(|event| event.event_type == "security_headers_applied")
+            .collect();
+        assert_eq!(
+            applied.len(),
+            1,
+            "the forwarded request fired once and the block stayed silent: {applied:?}"
+        );
+        assert_eq!(applied[0].metadata["path"].as_str(), Some("/hello"));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_security_header_set_stays_silent() {
+        // The reference fires the event from `get_headers` behind the
+        // `enabled` gate: a disabled set renders no headers and
+        // dispatches nothing, even with a bus installed. The rate-limit
+        // crossing is the positive control: the bus is wired and carries
+        // the limiter's event, and nothing else.
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let disabled = guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig {
+                enabled: false,
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            }),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        );
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(disabled)
+            .with_rate_limiting(limiter(1, false))
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        // Rocket's own Shield renders `X-Content-Type-Options` on every
+        // response; detaching the NoSniff policy leaves the guard's set
+        // as the only source, so the disabled-config assertion is honest.
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing.clone())
+                .attach(rocket::shield::Shield::default().disable::<rocket::shield::NoSniff>())
+                .mount("/", routes![hello_stateful]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .get("/hello")
+            .remote(peer("192.0.2.99"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("x-content-type-options"),
+            None,
+            "a disabled set renders no headers"
+        );
+        let (status, _, _) = full_status(fairing, "/hello", "192.0.2.99").await;
+        assert_eq!(status, Status::TooManyRequests, "the control fires");
+        let events = events.lock().expect("events");
+        let applied: Vec<&guard_core_rs::events::SecurityEvent> = events
+            .iter()
+            .filter(|event| event.event_type == "security_headers_applied")
+            .collect();
+        assert_eq!(applied.len(), 0, "a disabled set stays silent: {applied:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "only the limiter's control event: {events:?}"
+        );
+        assert_eq!(events[0].event_type, "rate_limited");
     }
 
     /// A distributed store that always fails (the backend is down).
