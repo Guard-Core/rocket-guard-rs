@@ -1,7 +1,7 @@
 # Examples
 
 The repository ships two runnable applications under
-[`examples/`](https://github.com/rennf93/rocket-guard-rs/tree/master/examples).
+[`examples/`](https://github.com/Guard-Core/rocket-guard-rs/tree/master/examples).
 Both use the real adapter surface: `GuardFairing` attached once, plus a
 `BlockGuard` or `GuardBody` argument on every protected route (Rocket's own
 enforcement mechanism).
@@ -13,7 +13,7 @@ checkout (see the repository README).
 ## simple_app
 
 A minimal guarded Rocket application
-([`examples/simple_app`](https://github.com/rennf93/rocket-guard-rs/tree/master/examples/simple_app)):
+([`examples/simple_app`](https://github.com/Guard-Core/rocket-guard-rs/tree/master/examples/simple_app)):
 
 | Route | Guard | Behavior |
 |---|---|---|
@@ -35,7 +35,7 @@ cargo run -p rocket-guard-simple-app
 ## advanced_app
 
 A production-shaped guarded application
-([`examples/advanced_app`](https://github.com/rennf93/rocket-guard-rs/tree/master/examples/advanced_app))
+([`examples/advanced_app`](https://github.com/Guard-Core/rocket-guard-rs/tree/master/examples/advanced_app))
 that demonstrates environment-driven engine configuration and the per-route
 enforcement split: guarded routes (`BlockGuard` / `GuardBody`) refuse
 threats, `/health` is excluded (no guard argument), and `/open` is scanned

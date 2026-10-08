@@ -2,7 +2,7 @@
 //!
 //! Differences from `simple_app`:
 //!
-//! - The engine [`DetectConfig`] and the adapter body cap are driven by
+//! - The engine \[`DetectConfig`\] and the adapter body cap are driven by
 //!   environment variables (see `env_config` below), so a deployment tunes
 //!   detection without a rebuild.
 //! - The per-route enforcement split is made explicit: guarded routes
@@ -60,7 +60,7 @@ fn admin_stats(_guard: BlockGuard) -> &'static str {
     "stats"
 }
 
-/// Build the engine [`DetectConfig`] from environment variables.
+/// Build the engine \[`DetectConfig`\] from environment variables.
 ///
 /// Every knob is optional; unset variables fall back to the ecosystem
 /// defaults pinned in [`default_config`].

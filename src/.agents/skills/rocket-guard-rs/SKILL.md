@@ -1,6 +1,6 @@
 ---
 name: rocket-guard-rs
-description: Use when working in rocket-guard-rs (github.com/rennf93/rocket-guard-rs), the Rocket Fairing adapter for the guard-core-rs detection engine: editing this crate, planning or reviewing the Fairing implementation, wiring guard-core-rs into Rocket, or answering questions about the repository's status. The repo is currently a 14-line cargo new scaffold with zero dependencies (not even rocket), no engine integration, and no CI that compiles code; everything here must be described as roadmap, not reality.
+description: Use when working in rocket-guard-rs (github.com/Guard-Core/rocket-guard-rs), the Rocket Fairing adapter for the guard-core-rs detection engine: editing this crate, planning or reviewing the Fairing implementation, wiring guard-core-rs into Rocket, or answering questions about the repository's status. The repo is currently a 14-line cargo new scaffold with zero dependencies (not even rocket), no engine integration, and no CI that compiles code; everything here must be described as roadmap, not reality.
 ---
 
 # rocket-guard-rs
@@ -10,7 +10,7 @@ Reserved namespace for the Rocket adapter of the Guard ecosystem. Currently a sc
 ## Quick Reference
 
 - Status: implemented. Version 0.0.1, edition 2024, MIT, not published.
-- Engine: [guard-core-rs](https://github.com/rennf93/guard-core-rs) (itself pre-1.0).
+- Engine: [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) (itself pre-1.0).
 - This adapter holds framework glue only; all security logic belongs in the engine.
 
 ## Installation
@@ -18,7 +18,7 @@ Reserved namespace for the Rocket adapter of the Guard ecosystem. Currently a sc
 Not published to crates.io and not usable. To work on the source:
 
 ```bash
-git clone https://github.com/rennf93/rocket-guard-rs
+git clone https://github.com/Guard-Core/rocket-guard-rs
 cd rocket-guard-rs
 ```
 
@@ -64,7 +64,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Related Projects
 
-- [guard-core-rs](https://github.com/rennf93/guard-core-rs): the engine (pre-1.0, work in progress).
-- Sibling adapters: [tower-guard-rs](https://github.com/rennf93/tower-guard-rs), [axum-guard-rs](https://github.com/rennf93/axum-guard-rs), [actix-guard-rs](https://github.com/rennf93/actix-guard-rs).
-- [guard-core](https://github.com/rennf93/guard-core): Python reference implementation (spec 4.0.2).
-- [fastapi-guard](https://github.com/rennf93/fastapi-guard): most mature ecosystem adapter; reference for feature coverage.
+- [guard-core-rs](https://github.com/Guard-Core/guard-core-rs): the engine (pre-1.0, work in progress).
+- Sibling adapters: [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs), [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs), [actix-guard-rs](https://github.com/Guard-Core/actix-guard-rs).
+- [guard-core](https://github.com/Guard-Core/guard-core): Python reference implementation (spec 4.0.2).
+- [fastapi-guard](https://github.com/Guard-Core/fastapi-guard): most mature ecosystem adapter; reference for feature coverage.

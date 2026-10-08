@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Merged as rennf93/guard-core-rs#22; tracks master.
-          repository: rennf93/guard-core-rs
+          repository: Guard-Core/guard-core-rs
           ref: master
           path: core-checkout
           persist-credentials: false
