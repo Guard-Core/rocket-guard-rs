@@ -102,6 +102,11 @@ pub struct GuardFairing {
     events: Option<std::sync::Arc<SecurityEventBus>>,
     observability: Option<ObservabilityConfig>,
     on_block: Option<OnBlockHook>,
+    /// The reference `custom_response_modifier`: mutates the response
+    /// view the response pass composes before it leaves the pipeline.
+    response_modifier: Option<guard_core_engine::payload::ResponseModifierFn>,
+    /// The reference `on_error` best-effort hook.
+    on_error: Option<guard_core_rs::responses::OnErrorHook>,
     custom_error_responses: CustomErrorResponses,
     passive_mode: bool,
     /// The reference `enable_penetration_detection`: the global scan
@@ -169,6 +174,8 @@ impl GuardFairing {
             observability: None,
             on_block: None,
             custom_error_responses: CustomErrorResponses::new(),
+            response_modifier: None,
+            on_error: None,
             passive_mode: false,
             penetration_detection_enabled: true,
             distributed: None,
@@ -686,6 +693,29 @@ impl GuardFairing {
         self
     }
 
+    /// Install the reference `custom_response_modifier`: the callback
+    /// runs LAST in the response pass (after the CORS verdict) over the
+    /// response view every guard-rendered answer composes. A panicking
+    /// callback leaves the view unmodified (the reference's except arm)
+    /// and reports through the `on_error` hook when one is installed.
+    #[must_use]
+    pub fn with_custom_response_modifier(
+        mut self,
+        modifier: guard_core_engine::payload::ResponseModifierFn,
+    ) -> Self {
+        self.response_modifier = Some(modifier);
+        self
+    }
+
+    /// Install the reference `on_error` best-effort hook: invoked when a
+    /// middleware step fails, receiving `(stage, error, context)`. A
+    /// raising callback is caught and dropped, never propagated.
+    #[must_use]
+    pub fn with_on_error(mut self, hook: guard_core_rs::responses::OnErrorHook) -> Self {
+        self.on_error = Some(hook);
+        self
+    }
+
     /// Install the reference `custom_error_responses` map: status code to
     /// message body, overriding the family default for that status on
     /// every block answer the guard renders (`429`, both `403` banned
@@ -1139,6 +1169,33 @@ impl Fairing for GuardFairing {
             };
             let _action =
                 processor.process(&request_bits, &mut bits, None, std::time::SystemTime::now());
+
+            // The reference `custom_response_modifier`: the callback runs
+            // LAST over the response view. A panicking callback restores
+            // the unmodified view (the reference's except arm) and
+            // reports through the `on_error` hook.
+            if let Some(modifier) = &self.response_modifier {
+                let unmodified = bits.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    modifier(&mut bits);
+                }));
+                if outcome.is_err() {
+                    bits = unmodified;
+                    if let Some(hook) = &self.on_error {
+                        hook(
+                            "custom_response_modifier",
+                            "the response modifier panicked; returning unmodified response",
+                            &[("path".to_owned(), request.uri().path().as_str().to_owned())],
+                        );
+                    }
+                }
+            }
+
+            if bits.status != response.status().code
+                && let Some(code) = rocket::http::Status::from_code(bits.status)
+            {
+                response.set_status(code);
+            }
             for (name, value) in bits.headers {
                 response.set_raw_header(name, value);
             }
@@ -2355,6 +2412,21 @@ mod stateful_tests {
     }
 
     /// Status, body, and the `Retry-After` header of one dispatched request.
+    fn bare_processor() -> guard_core_rs::process_response::ResponseProcessor {
+        guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            guard_core_engine::ip_ban::IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        )
+    }
+
     async fn full_status(
         fairing: GuardFairing,
         path: &str,
@@ -3303,6 +3375,73 @@ mod stateful_tests {
         assert_eq!(status, Status::BadRequest);
     }
 
+    #[tokio::test]
+    async fn the_response_modifier_mutates_the_response_view() {
+        // The reference `custom_response_modifier`: the callback runs
+        // last over the response view - a header lands and a status
+        // rewrite propagates.
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|bits: &mut ResponseBits| {
+                bits.headers
+                    .insert("X-Modified-By".to_owned(), "guard".to_owned());
+                bits.status = 201;
+            }));
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .get("/hello")
+            .remote(peer("203.0.113.9"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Created);
+        assert_eq!(response.headers().get_one("X-Modified-By"), Some("guard"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_response_modifier_restores_and_reports() {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|_bits: &mut ResponseBits| {
+                panic!("modifier exploded");
+            }))
+            .with_on_error(Arc::new(move |stage, error, _context| {
+                sink.lock()
+                    .expect("sink")
+                    .push((stage.to_owned(), error.to_owned()));
+            }));
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .get("/hello")
+            .remote(peer("203.0.113.9"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert!(
+            response
+                .headers()
+                .get_one("X-Content-Type-Options")
+                .is_some(),
+            "the security headers survive the panicking modifier"
+        );
+        let seen = seen.lock().expect("sink");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "custom_response_modifier");
+    }
     #[tokio::test]
     async fn the_log_level_knobs_feed_the_stage_surfaces() {
         // `log_request_level` installs the request-logging stage; the
