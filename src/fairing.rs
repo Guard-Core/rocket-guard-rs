@@ -19,7 +19,7 @@ use guard_core_rs::geo::GeoStage;
 use guard_core_rs::headers_auth::HeadersAuthStage;
 use guard_core_rs::https_enforcement::HttpsEnforcementStage;
 use guard_core_rs::process_response::{RequestBits, ResponseBits, ResponseProcessor};
-use guard_core_rs::request_logging::RequestLoggingStage;
+use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
 use guard_core_rs::responses::{CustomErrorResponses, OnBlockHook};
 use guard_core_rs::route_gates::{ReferrerStage, TimeWindowStage};
 use guard_core_rs::tower::RouteRateResolver;
@@ -367,11 +367,39 @@ impl GuardFairing {
             });
         }
 
+        if let Some(level) = config.log_request_level {
+            // The reference construction gate: the request-logging check
+            // exists only when `log_request_level` is set.
+            fairing =
+                fairing.with_request_logging(RequestLoggingStage::new(RequestLoggingStageConfig {
+                    log_request_level: Some(crate::map_log_level(level)),
+                    muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                    sensitive: guard_core_rs::redact::SensitiveNames::new(
+                        Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                        Some(&config.log_sensitive_params.iter().cloned().collect()),
+                        Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                    ),
+                }));
+        }
+
         if let Some(level) = config.log_suspicious_level {
             fairing = fairing.with_observability(ObservabilityConfig {
                 log_suspicious_level: Some(crate::map_log_level(level)),
-                log_request_level: None,
-                log_country_check_level: None,
+                log_request_level: config.log_request_level.map(crate::map_log_level),
+                log_country_check_level: config.log_country_check_level.map(crate::map_log_level),
+                muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                sensitive: guard_core_rs::redact::SensitiveNames::new(
+                    Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                    Some(&config.log_sensitive_params.iter().cloned().collect()),
+                    Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                ),
+            });
+        } else if let Some(country_level) = config.log_country_check_level {
+            // Country verdicts compose even without a suspicious level.
+            fairing = fairing.with_observability(ObservabilityConfig {
+                log_suspicious_level: None,
+                log_request_level: config.log_request_level.map(crate::map_log_level),
+                log_country_check_level: Some(crate::map_log_level(country_level)),
                 muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
                 sensitive: guard_core_rs::redact::SensitiveNames::new(
                     Some(&config.log_sensitive_headers.iter().cloned().collect()),
@@ -1481,6 +1509,19 @@ impl GuardFairing {
         }
 
         let gate = crate::scan::gate_decision(request);
+        // The country-verdict lines (the reference
+        // `_log_country_check_result`): the non-block verdicts ride
+        // `log_country_check_level`, blocks ride `log_suspicious_level`
+        // (compose-only, like the request-logging stage).
+        if let (Some(observability), Some(stage)) =
+            (self.observability.as_ref(), self.geo_blocking.as_ref())
+        {
+            let _ = stage.country_check_log(
+                ip,
+                observability.log_suspicious_level,
+                observability.log_country_check_level,
+            );
+        }
         // The reference runs the country arms inside the `ip`-gated
         // block: the same bypass skips the geo stage.
         if !bypassed("ip")
@@ -3260,6 +3301,81 @@ mod stateful_tests {
         )
         .await;
         assert_eq!(status, Status::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn the_log_level_knobs_feed_the_stage_surfaces() {
+        // `log_request_level` installs the request-logging stage; the
+        // country-verdict composer rides `log_country_check_level` off
+        // the observability config.
+        let config = SecurityConfig {
+            log_request_level: Some(guard_core_engine::security_config::LogLevel::Info),
+            log_country_check_level: Some(guard_core_engine::security_config::LogLevel::Debug),
+            ..SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid");
+        assert!(
+            fairing.request_logging.is_some(),
+            "the level installs the request-logging stage"
+        );
+        let observability = fairing
+            .observability
+            .as_ref()
+            .expect("country level installs it");
+        assert_eq!(
+            observability.log_request_level,
+            Some(guard_core_rs::logging::LogLevel::Info)
+        );
+        assert_eq!(
+            observability.log_country_check_level,
+            Some(guard_core_rs::logging::LogLevel::Debug)
+        );
+
+        // The reference default: no request level (no stage), the
+        // country level at its INFO default (observability installs).
+        let fairing =
+            GuardFairing::from_security_config(&SecurityConfig::default()).expect("valid");
+        assert!(fairing.request_logging.is_none());
+        let observability = fairing
+            .observability
+            .as_ref()
+            .expect("the INFO country default");
+        assert_eq!(observability.log_request_level, None);
+        assert_eq!(
+            observability.log_country_check_level,
+            Some(guard_core_rs::logging::LogLevel::Info)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_country_level_alone_installs_observability_and_composes() {
+        let config = SecurityConfig {
+            log_suspicious_level: None,
+            blocked_countries: [String::from("RU")].into_iter().collect(),
+            ..SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid");
+        let observability = fairing.observability.as_ref().expect("the country default");
+        assert_eq!(observability.log_suspicious_level, None);
+
+        // A dispatch through the geo position composes the verdict line
+        // (the geo stage is a host-provided collaborator).
+        let path = "/hello?q=benign";
+        let (status, _, _) = full_status(
+            GuardFairing::from_security_config(&config)
+                .expect("valid")
+                .with_geo_blocking(guard_core_rs::geo::GeoStage::new(
+                    guard_core_rs::geo::GeoStageConfig {
+                        gate: guard_core_engine::geo::parse_country_lists([] as [&str; 0], ["RU"]),
+                        handler: None,
+                        passive_mode: false,
+                    },
+                )),
+            path,
+            "203.0.113.9",
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
     }
     #[tokio::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
