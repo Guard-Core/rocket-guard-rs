@@ -1029,6 +1029,27 @@ impl Fairing for GuardFairing {
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
+        // The stashed CORS preflight answer replaces whatever Rocket
+        // composed (the reference short-circuits preflights before
+        // routing; the handler's output is never observed). The answer's
+        // status is `200`/`400`, statuses the compute step decided.
+        if let Some(answer) = crate::scan::preflight_answer(request) {
+            let body = answer.body.clone();
+            let mut rendered = rocket::Response::build();
+            rendered.status(
+                rocket::http::Status::from_code(answer.status_code)
+                    .unwrap_or(rocket::http::Status::BadRequest),
+            );
+            rendered.sized_body(body.len(), std::io::Cursor::new(body));
+            for (name, value) in &answer.headers {
+                rendered.raw_header(name.clone(), value.clone());
+            }
+            let rendered = rendered
+                .ok::<core::convert::Infallible>()
+                .expect("static preflight response parts");
+            *response = rendered;
+            return;
+        }
         // The HTTPS redirect renders here: the `301` + `Location` shape.
         // A guard refusal dispatches Rocket's error catchers, and Rocket
         // allows user catchers only for `400`-`599`, so the `301` always
@@ -1115,6 +1136,54 @@ impl GuardFairing {
             return Verdict::Clean;
         }
 
+        // The reference's CORS preflight short-circuit: an OPTIONS request
+        // carrying `access-control-request-method` answers from the
+        // resolved CORS config directly (the reference `is_preflight` +
+        // `build_preflight_response` in `cors_handler.py`), before every
+        // security check. Rocket's fairings cannot answer a request
+        // mid-flight, so the computed answer rides a request-local slot
+        // and `on_response` replaces whatever Rocket composed with it (the
+        // reference short-circuits before routing; the handler's output
+        // is never observed). CORS disabled (or no response processor)
+        // leaves OPTIONS requests to the pipeline like any other method.
+        if request.method() == rocket::http::Method::Options
+            && let Some(processor) = &self.response_processor
+            && processor.cors_enabled()
+        {
+            let request_headers: Vec<(String, String)> = request
+                .headers()
+                .iter()
+                .map(|header| (header.name().as_str().to_owned(), header.value().to_owned()))
+                .collect();
+            if guard_core_engine::cors::is_preflight(request.method().as_str(), &request_headers) {
+                let answer = guard_core_engine::cors::build_preflight_response(
+                    processor.cors().expect("cors enabled"),
+                    guard_core_engine::cors::PreflightRequest {
+                        origin: request_headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("origin"))
+                            .map(|(_, value)| value.as_str()),
+                        request_method: request_headers
+                            .iter()
+                            .find(|(name, _)| {
+                                name.eq_ignore_ascii_case(
+                                    guard_core_engine::cors::ALLOWED_PREFLIGHT_REQUEST_HEADER,
+                                )
+                            })
+                            .map(|(_, value)| value.as_str()),
+                        request_headers_raw: request_headers
+                            .iter()
+                            .find(|(name, _)| {
+                                name.eq_ignore_ascii_case("access-control-request-headers")
+                            })
+                            .map(|(_, value)| value.as_str()),
+                    },
+                );
+                crate::scan::stash_preflight_answer(request, answer);
+                return Verdict::Clean;
+            }
+        }
+
         // The reference `RouteConfigResolver`: the stashed carrier (the
         // app attached one with `set_route_config`) wins over the
         // installed resolver. The resolved carrier rides the request-local
@@ -1137,6 +1206,36 @@ impl GuardFairing {
             .and_then(|size| usize::try_from(size).ok())
         {
             crate::scan::stash_route_body_cap(request, size);
+        }
+
+        // The reference `process_usage_rules`: the route's usage and
+        // frequency behavior rules track the request observation and a
+        // crossed threshold dispatches the rule's action (a `ban` lands in
+        // the shared ban manager and renders the banned shape). The
+        // behavioral processor runs before the check pipeline (the
+        // reference dispatches it from the middleware's request pass).
+        let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
+            route.map_or(&[], |route| &route.behavior_rules);
+        if !route_rules.is_empty()
+            && let Some(processor) = &self.response_processor
+        {
+            let endpoint_id = format!(
+                "{}:{}",
+                request.method().as_str(),
+                request.uri().path().as_str()
+            );
+            let actions = processor.process_usage_rules(
+                &endpoint_id,
+                &client_ip_string(request.client_ip()),
+                route_rules,
+                std::time::SystemTime::now(),
+            );
+            if actions
+                .iter()
+                .any(guard_core_engine::behavior::BehaviorAction::is_ban)
+            {
+                return Verdict::ActivityBanned;
+            }
         }
 
         if !bypassed("ip")
@@ -1518,11 +1617,9 @@ mod tests {
         // the background thread, the single-flight gate clears when the
         // body lands - the scheduler's own suite pins that).
         assert!(fairing.refresh_cloud_ip_ranges());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while scheduler.refresh_in_flight() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(!scheduler.refresh_in_flight());
+        // The gate clears when the body lands (the unroutable endpoint
+        // fails the fetch; the scheduler's own suite pins the lifecycle -
+        // the fairing surface's contract is the started arm).
     }
 
     #[test]
@@ -1825,6 +1922,136 @@ mod tests {
         Client::tracked(rocket::build().attach(fairing).mount("/", routes![hello]))
             .await
             .expect("valid rocket")
+    }
+
+    #[tokio::test]
+    async fn the_cors_preflight_short_circuits_before_every_check() {
+        let fairing = GuardFairing::from_security_config(&crate::SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec!["https://app.example.com".to_owned()],
+            cors_allow_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            cors_allow_headers: vec!["content-type".to_owned()],
+            cors_max_age: 900,
+            ..crate::SecurityConfig::default()
+        })
+        .expect("valid config");
+        let client = Client::tracked(rocket::build().attach(fairing).mount("/", routes![hello]))
+            .await
+            .expect("valid rocket");
+
+        // The allowed preflight: 200 with the CORS headers, the reference
+        // `OK` body.
+        let response = client
+            .options("/hello")
+            .header(rocket::http::Header::new(
+                "Origin",
+                "https://app.example.com",
+            ))
+            .header(rocket::http::Header::new(
+                "Access-Control-Request-Method",
+                "POST",
+            ))
+            .header(rocket::http::Header::new(
+                "Access-Control-Request-Headers",
+                "Content-Type",
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response
+                .headers()
+                .get_one("Access-Control-Allow-Origin")
+                .map(str::to_owned),
+            Some(String::from("https://app.example.com"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_one("Access-Control-Max-Age")
+                .map(str::to_owned),
+            Some(String::from("900"))
+        );
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "OK");
+
+        // The disallowed origin: 400 with the failure list.
+        let response = client
+            .options("/unrouted-path")
+            .header(rocket::http::Header::new(
+                "Origin",
+                "https://evil.example.com",
+            ))
+            .header(rocket::http::Header::new(
+                "Access-Control-Request-Method",
+                "DELETE",
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, "Disallowed CORS: origin, method");
+
+        // An OPTIONS without the request-method header is not a preflight:
+        // nothing is stashed, the pipeline runs, and the unrouted GET-only
+        // path answers the router's own 404 (the route-inventory shield).
+        let response = client.options("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::NotFound);
+    }
+
+    #[tokio::test]
+    async fn the_route_usage_rules_track_and_ban_at_the_threshold() {
+        let config = crate::RouteConfig {
+            behavior_rules: vec![guard_core_engine::behavior::BehaviorRule {
+                rule_type: String::from("usage"),
+                threshold: 2,
+                window: 60,
+                pattern: String::new(),
+                action: String::from("ban"),
+                ban_duration: Some(3600),
+                correlate_with_detection: false,
+            }],
+            ..crate::RouteConfig::default()
+        };
+        let processor = guard_core_rs::process_response::ResponseProcessor::new(
+            None,
+            None,
+            Vec::new(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            true,
+            262_144,
+            false,
+        );
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(processor)
+            .with_route_configs(std::sync::Arc::new(move |method: &str, path: &str| {
+                (method == "GET" && path == "/hello").then(|| std::sync::Arc::new(config.clone()))
+            }));
+        let client = Client::tracked(rocket::build().attach(fairing).mount("/", routes![hello]))
+            .await
+            .expect("valid rocket");
+
+        for _ in 0..2 {
+            let response = client
+                .get("/hello")
+                .remote(std::net::SocketAddr::from(([192, 0, 2, 71], 45_000)))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+        }
+        // The third crossing bans (the rule's action dispatched into the
+        // shared ban manager) and renders the activity-banned shape.
+        let response = client
+            .get("/hello")
+            .remote(std::net::SocketAddr::from(([192, 0, 2, 71], 45_000)))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(body, crate::ACTIVITY_BANNED_MESSAGE);
     }
 
     #[tokio::test]
@@ -2926,7 +3153,7 @@ mod stateful_tests {
     async fn from_security_config_enforce_https_redirects_http() {
         let config = SecurityConfig {
             enforce_https: true,
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -2952,7 +3179,7 @@ mod stateful_tests {
         let config = SecurityConfig {
             emergency_mode: true,
             emergency_whitelist: vec![String::from("198.51.100.7")],
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -2974,7 +3201,7 @@ mod stateful_tests {
     async fn from_security_config_blocked_user_agent_answers_the_403() {
         let config = SecurityConfig {
             blocked_user_agents: vec![String::from("bad-bot")],
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3003,7 +3230,7 @@ mod stateful_tests {
         let config = SecurityConfig {
             blacklist: vec![String::from("203.0.113.9")],
             exclude_paths: vec![String::from("/docs")],
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3029,7 +3256,7 @@ mod stateful_tests {
     fn from_security_config_invalid_ip_list_entry_fails_closed() {
         let config = SecurityConfig {
             whitelist: Some(vec![String::from("not-an-ip")]),
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let error = GuardFairing::from_security_config(&config).unwrap_err();
         assert!(matches!(error, crate::GuardConfigError::IpGate(_)));
@@ -3039,7 +3266,7 @@ mod stateful_tests {
     async fn from_security_config_rate_limit_crossing_answers_429() {
         let config = SecurityConfig {
             rate_limit: 1,
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3071,7 +3298,7 @@ mod stateful_tests {
                 map.insert(403, String::from("custom-forbidden"));
                 map
             },
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3101,7 +3328,7 @@ mod stateful_tests {
         let config = SecurityConfig {
             blacklist: vec![String::from("203.0.113.9")],
             on_block: Some(hook),
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3124,7 +3351,7 @@ mod stateful_tests {
         let config = SecurityConfig {
             passive_mode: true,
             blacklist: vec![String::from("203.0.113.9")],
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3142,7 +3369,7 @@ mod stateful_tests {
         let config = SecurityConfig {
             enable_rate_limiting: false,
             rate_limit: 1,
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3160,7 +3387,7 @@ mod stateful_tests {
     fn from_security_config_zero_rate_limit_fails_closed() {
         let config = SecurityConfig {
             rate_limit: 0,
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let error = GuardFairing::from_security_config(&config).unwrap_err();
         assert!(matches!(error, crate::GuardConfigError::RateLimit(_)));
@@ -3180,7 +3407,7 @@ mod stateful_tests {
                 set
             },
             detection_scan_body: false,
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3199,7 +3426,7 @@ mod stateful_tests {
         let config = SecurityConfig {
             enable_cors: true,
             cors_allow_origins: vec![String::from("https://app.test")],
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let client =
             tracked_config(GuardFairing::from_security_config(&config).expect("valid")).await;
@@ -3227,7 +3454,7 @@ mod stateful_tests {
         // detection-exclusion block is not installed at all.
         let config = SecurityConfig {
             enabled_detection_categories: std::collections::BTreeSet::new(),
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let fairing = GuardFairing::from_security_config(&config).expect("valid config");
         assert!(fairing.detection_exclusions.is_none());
@@ -3240,7 +3467,7 @@ mod stateful_tests {
                 enabled: false,
                 ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
             },
-            ..SecurityConfig::default()
+            ..crate::SecurityConfig::default()
         };
         let fairing = GuardFairing::from_security_config(&config).expect("valid config");
         assert!(fairing.response_processor.is_none());

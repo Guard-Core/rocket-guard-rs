@@ -536,6 +536,38 @@ pub(crate) fn enforce_body_finding(
     }
 }
 
+/// Request-local slot for the stashed CORS preflight answer: the fairing's
+/// `on_request` computes it (the reference short-circuits preflights before
+/// the pipeline) and `on_response` replaces whatever Rocket composed with
+/// it - a preflight answer is `200`/`400`, statuses no catcher can render.
+pub(crate) struct PreflightAnswer(
+    pub(crate) std::sync::Mutex<Option<guard_core_engine::cors::CorsPreflightResponse>>,
+);
+
+/// Stash the computed preflight answer for `on_response` to render.
+pub(crate) fn stash_preflight_answer(
+    request: &Request<'_>,
+    answer: guard_core_engine::cors::CorsPreflightResponse,
+) {
+    *request
+        .local_cache(|| PreflightAnswer(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("preflight slot") = Some(answer);
+}
+
+/// Read the stashed preflight answer, if any.
+pub(crate) fn preflight_answer(
+    request: &Request<'_>,
+) -> Option<guard_core_engine::cors::CorsPreflightResponse> {
+    request
+        .local_cache(|| PreflightAnswer(std::sync::Mutex::new(None)))
+        .0
+        .lock()
+        .expect("preflight slot")
+        .clone()
+}
+
 /// Request-local slot for the per-route rate-limit tier override (the
 /// Rocket counterpart of the reference's `request.state.route_config`).
 /// Interior-mutable because Rocket's request-local cache hands out shared
