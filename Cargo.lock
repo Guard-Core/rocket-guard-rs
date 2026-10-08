@@ -1422,6 +1422,7 @@ dependencies = [
  "http 1.5.0",
  "rocket",
  "rocket_ws",
+ "serde_json",
  "tokio",
 ]
 

@@ -183,6 +183,7 @@ mod scan;
 pub mod status;
 pub mod websocket;
 
+pub use crate::fairing::AgentStats;
 pub use crate::fairing::GuardFairing;
 pub use crate::guards::{BlockGuard, GuardBody, GuardBodyError};
 pub use crate::response::{
