@@ -128,6 +128,9 @@ pub(crate) struct Enforced(pub(crate) Option<Verdict>);
 pub(crate) struct GuardEngine {
     /// Detection knobs passed to every engine call.
     pub(crate) config: DetectConfig,
+    /// The reference `enable_penetration_detection`: the global scan
+    /// toggle (the reference default `true`).
+    pub(crate) penetration_detection_enabled: bool,
     /// Body buffering cap in bytes, enforced by [`crate::GuardBody`].
     pub(crate) body_cap: usize,
     /// Scan indirection so unit tests can substitute a panicking scanner
@@ -170,6 +173,7 @@ impl GuardEngine {
         Self {
             body_cap: config.max_full_scan_bytes,
             config,
+            penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             rate_limiter: None,
             ban_state: None,
@@ -277,6 +281,12 @@ impl GuardEngine {
         request: &Request<'_>,
         bytes: &[u8],
     ) -> Option<RequestScanVerdict> {
+        // The global `enable_penetration_detection` toggle: the body
+        // phase skips the scan like the metadata phase (the request
+        // proceeds clean).
+        if !self.penetration_detection_enabled {
+            return None;
+        }
         let text = String::from_utf8_lossy(bytes);
         if text.trim().is_empty() {
             return None;

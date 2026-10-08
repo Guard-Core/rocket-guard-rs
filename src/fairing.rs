@@ -104,6 +104,9 @@ pub struct GuardFairing {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     passive_mode: bool,
+    /// The reference `enable_penetration_detection`: the global scan
+    /// toggle (the reference default `true`).
+    penetration_detection_enabled: bool,
     distributed: Option<(std::sync::Arc<dyn SlidingWindowStore>, String, bool)>,
     distributed_ban_store: Option<std::sync::Arc<dyn BanStore>>,
     detection_exclusions: Option<DetectionExclusionConfig>,
@@ -167,6 +170,7 @@ impl GuardFairing {
             on_block: None,
             custom_error_responses: CustomErrorResponses::new(),
             passive_mode: false,
+            penetration_detection_enabled: true,
             distributed: None,
             distributed_ban_store: None,
             detection_exclusions: None,
@@ -262,6 +266,7 @@ impl GuardFairing {
             max_json_depth: config.detection_max_json_depth,
         })
         .with_passive_mode(config.passive_mode)
+        .with_penetration_detection(config.enable_penetration_detection)
         .with_exclude_paths(config.exclude_paths.clone());
 
         if config.whitelist.is_some()
@@ -676,6 +681,15 @@ impl GuardFairing {
         self
     }
 
+    /// Set the global scan toggle (`enable_penetration_detection`): the
+    /// reference default is enabled, so only a `false` changes behavior -
+    /// the detection scan is skipped and the request proceeds clean.
+    #[must_use]
+    pub fn with_penetration_detection(mut self, enabled: bool) -> Self {
+        self.penetration_detection_enabled = enabled;
+        self
+    }
+
     /// Run the limiter and ban engine over a distributed store (the
     /// reference `enable_redis && redis_handler` conjunction): a
     /// [`SlidingWindowStore`] plus the reference `redis_prefix` and
@@ -996,6 +1010,7 @@ impl Fairing for GuardFairing {
             engine
                 .detection_exclusions
                 .clone_from(&self.detection_exclusions);
+            engine.penetration_detection_enabled = self.penetration_detection_enabled;
             engine.route_exclusions.clone_from(&self.route_exclusions);
             engine.scan_fn = self.scan_fn;
             engine.observability.clone_from(&self.observability);
@@ -1441,7 +1456,10 @@ impl GuardFairing {
         // flow is two-phase (see the module docs).
         // The reference `suspicious_activity` bypass skips the scan (and
         // with it the violation feed) for the route.
-        let metadata = if bypassed("penetration") {
+        // The reference `suspicious_activity` bypass skips the scan for
+        // the route; the global `enable_penetration_detection` toggle
+        // skips it everywhere (the request proceeds clean).
+        let metadata = if bypassed("penetration") || !self.penetration_detection_enabled {
             None
         } else {
             match catch_unwind(AssertUnwindSafe(|| engine.scan_metadata(request))) {
@@ -3138,6 +3156,32 @@ mod stateful_tests {
         .expect("valid rocket")
     }
 
+    #[tokio::test]
+    async fn the_penetration_detection_toggle_skips_the_scan() {
+        // `enable_penetration_detection = false` skips the multi-surface
+        // scan entirely: the attack rides through clean (200).
+        let config = SecurityConfig {
+            enable_penetration_detection: false,
+            ..SecurityConfig::default()
+        };
+        let path = "/hello?q=1+UNION+SELECT+password";
+        let (status, _, _) = full_status(
+            GuardFairing::from_security_config(&config).expect("valid"),
+            path,
+            "203.0.113.9",
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "the toggle disables the scan");
+
+        // The default (enabled) scans and blocks.
+        let (status, _, _) = full_status(
+            GuardFairing::from_security_config(&SecurityConfig::default()).expect("valid"),
+            path,
+            "203.0.113.9",
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest);
+    }
     #[tokio::test]
     async fn from_security_config_feeds_the_scan_budgets() {
         // The scan-budget knobs ride the unified config onto the scan
