@@ -30,6 +30,7 @@ guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", versio
 guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.1" }
 rocket = { version = "0.5.1", default-features = false }
 rocket_ws = { version = "0.1.1", features = ["tokio-tungstenite"] }
+serde_json = "1"
 
 [dev-dependencies]
 chrono = "0.4"
