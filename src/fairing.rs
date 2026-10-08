@@ -257,6 +257,9 @@ impl GuardFairing {
             semantic_threshold: config.detection_semantic_threshold,
             threat_score_threshold: config.detection_threat_score_threshold,
             binary_min_run_length: config.detection_binary_min_run_length,
+            max_scan_values: config.detection_max_scan_values,
+            max_scan_chars: config.detection_max_scan_chars,
+            max_json_depth: config.detection_max_json_depth,
         })
         .with_passive_mode(config.passive_mode)
         .with_exclude_paths(config.exclude_paths.clone());
@@ -3135,6 +3138,38 @@ mod stateful_tests {
         .expect("valid rocket")
     }
 
+    #[tokio::test]
+    async fn from_security_config_feeds_the_scan_budgets() {
+        // The scan-budget knobs ride the unified config onto the scan
+        // path: a two-value budget stops the scan before the third
+        // value, so the threat in the last query param never surfaces.
+        let config = SecurityConfig {
+            detection_max_scan_values: 2,
+            ..SecurityConfig::default()
+        };
+        let path = "/hello?a=benign-one&b=benign-two&c=1+UNION+SELECT+password";
+        let (status, _, _) = full_status(
+            GuardFairing::from_security_config(&config).expect("valid"),
+            path,
+            "203.0.113.9",
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::Ok,
+            "values past the scan-value budget are not scanned"
+        );
+
+        // The same request under the default budget scans (the
+        // below-threshold detection block, the family 400 shape).
+        let (status, _, _) = full_status(
+            GuardFairing::from_security_config(&SecurityConfig::default()).expect("valid"),
+            path,
+            "203.0.113.9",
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest);
+    }
     #[tokio::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
         let config = SecurityConfig::default();
