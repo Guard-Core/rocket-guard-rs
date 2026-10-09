@@ -67,15 +67,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build the demo image
+        # Compose's bake refuses to read the sibling engine context outside
+        # the working directory (fs.read=..), so invoke compose from the
+        # parent directory: the engine checkout then falls inside the
+        # default read scope.
+        working-directory: ${{ github.workspace }}/..
         run: |
-          docker compose -f examples/advanced_app/docker-compose.yml build advanced-app
+          docker compose -f rocket-guard-rs/examples/advanced_app/docker-compose.yml build advanced-app
 
       - name: Tag and push to GHCR
         run: |
-          docker tag Rust/rocket-guard-rs-advanced-app:local ghcr.io/guard-core/Rust/rocket-guard-rs-example:latest
-          docker push ghcr.io/guard-core/Rust/rocket-guard-rs-example:latest
+          docker tag rocket-guard-rs-advanced-app:local ghcr.io/guard-core/rocket-guard-rs-example:latest
+          docker push ghcr.io/guard-core/rocket-guard-rs-example:latest
 
           if [[ "${{ env.IS_RELEASE }}" == "true" ]]; then
-            docker tag Rust/rocket-guard-rs-advanced-app:local ghcr.io/guard-core/Rust/rocket-guard-rs-example:${{ env.VERSION }}
-            docker push ghcr.io/guard-core/Rust/rocket-guard-rs-example:${{ env.VERSION }}
+            docker tag rocket-guard-rs-advanced-app:local ghcr.io/guard-core/rocket-guard-rs-example:${{ env.VERSION }}
+            docker push ghcr.io/guard-core/rocket-guard-rs-example:${{ env.VERSION }}
           fi
