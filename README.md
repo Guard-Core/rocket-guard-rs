@@ -1,10 +1,62 @@
-# rocket-guard-rs
+<p align="center">
+    <a href="https://guard-core.github.io/guard-core/latest/">
+        <img src="https://guard-core.github.io/guard-core/latest/assets/guard_core_legend.svg" alt="Guard Core">
+    </a>
+</p>
 
-Application-layer security middleware for [Rocket](https://rocket.rs) 0.5, powered by the [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine. Part of the [guard ecosystem](https://github.com/Guard-Core).
+___
 
-Docs: <https://guard-core.github.io/rocket-guard-rs/>
+<p align="center">
+    <strong>Application-layer security middleware for [Rocket](https://rocket.rs) 0.5, powered by the [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine. Part of the [guard ecosystem](https://github.com/Guard-Core).</strong>
+</p>
 
-**Status:** Released. Version 1.2.0, published to crates.io. `GuardFairing`, `BlockGuard`, and `GuardBody` are working Rocket integration, screened by the engine.
+<p align="center">
+    <a href="https://crates.io/crates/rocket-guard-rs">
+        <img src="https://img.shields.io/crates/v/rocket-guard-rs?color=0080ff" alt="Crates.io version">
+    </a>
+    <a href="https://guard-core.github.io/rocket-guard-rs/latest/">
+        <img src="https://img.shields.io/badge/docs-latest-0080ff.svg" alt="Docs">
+    </a>
+    <a href="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/release.yml">
+        <img src="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/release.yml/badge.svg" alt="Release">
+    </a>
+    <a href="https://opensource.org/licenses/MIT">
+        <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+    </a>
+    <a href="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/ci.yml">
+        <img src="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/ci.yml/badge.svg" alt="CI">
+    </a>
+    <a href="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/code-ql.yml">
+        <img src="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/code-ql.yml/badge.svg" alt="CodeQL">
+    </a>
+</p>
+
+<p align="center">
+    <a href="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/pages/pages-build-deployment">
+        <img src="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/pages/pages-build-deployment/badge.svg?branch=gh-pages" alt="PagesBuildDeployment">
+    </a>
+    <a href="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/docs.yml">
+        <img src="https://github.com/Guard-Core/rocket-guard-rs/actions/workflows/docs.yml/badge.svg" alt="DocsUpdate">
+    </a>
+    <img src="https://img.shields.io/github/last-commit/Guard-Core/rocket-guard-rs?style=flat&amp;logo=git&amp;logoColor=white&amp;color=0080ff" alt="last-commit">
+</p>
+
+<p align="center">
+    <img src="https://img.shields.io/badge/Rocket-1B1B1B.svg?style=flat" alt="Rocket">
+    <a href="https://crates.io/crates/rocket-guard-rs">
+        <img src="https://img.shields.io/crates/d/rocket-guard-rs" alt="Downloads">
+    </a>
+</p>
+
+<p align="center">
+    <a href="https://guard-core.com">Website</a> &middot;
+    <a href="https://guard-core.github.io/rocket-guard-rs/latest/">Docs</a> &middot;
+    <a href="https://playground.guard-core.com">Playground</a> &middot;
+    <a href="https://app.guard-core.com">Dashboard</a> &middot;
+    <a href="https://discord.gg/ZW7ZJbjMkK">Discord</a>
+</p>
+
+---
 
 ## About
 
