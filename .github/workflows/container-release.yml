@@ -1,0 +1,81 @@
+name: Publish Containerized Demo
+
+on:
+  release:
+    types: [created]
+  push:
+    branches:
+      - master
+    paths:
+      - 'examples/**'
+      - '.github/workflows/container-release.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: container-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-container:
+    name: Build and push the containerized demo
+    runs-on: ubuntu-latest
+    # A cold Rust release build of the demo stack takes several minutes;
+    # keep the budget generous.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The demo builds the adapter from the repo and the engine from its
+      # sibling path dependency (../guard-core-rs), so check out the engine
+      # next to the workspace; the compose additional_context points at it.
+      - name: Checkout guard-core-rs (sibling path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Guard-Core/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the sibling path dependency location
+        run: mv core-checkout ../guard-core-rs
+
+      - name: Set version tag
+        id: set_version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "VERSION=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+            echo "IS_RELEASE=true" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=latest" >> "$GITHUB_ENV"
+            echo "IS_RELEASE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the demo image
+        run: |
+          docker compose -f examples/advanced_app/docker-compose.yml build advanced-app
+
+      - name: Tag and push to GHCR
+        run: |
+          docker tag Rust/rocket-guard-rs-advanced-app:local ghcr.io/guard-core/Rust/rocket-guard-rs-example:latest
+          docker push ghcr.io/guard-core/Rust/rocket-guard-rs-example:latest
+
+          if [[ "${{ env.IS_RELEASE }}" == "true" ]]; then
+            docker tag Rust/rocket-guard-rs-advanced-app:local ghcr.io/guard-core/Rust/rocket-guard-rs-example:${{ env.VERSION }}
+            docker push ghcr.io/guard-core/Rust/rocket-guard-rs-example:${{ env.VERSION }}
+          fi
