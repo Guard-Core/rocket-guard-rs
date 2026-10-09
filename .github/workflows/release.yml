@@ -6,6 +6,7 @@ on:
       - 'v*'
   release:
     types: [created]
+  workflow_dispatch:
 
 permissions: {}
 
@@ -50,6 +51,13 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
           rustflags: ""
+
+      # The engine's ReDoS validator spawns the pattern-probe child over the
+      # workspace target dir, and cargo test does not build dependency bins -
+      # without this the user-agent patterns fail secure at the tag (the
+      # guard-core-rs 4ab7f95 fix, adapter side; ci.yml already carries it).
+      - name: Build the pattern-probe child
+        run: cargo build -p guard-core-engine --bins
 
       - name: cargo fmt check
         run: cargo fmt --all -- --check
@@ -101,12 +109,15 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: tag-consistency
-    if: github.event_name == 'release'
+    # Trusted publishing (crates.io enforces it for this crate): the job
+    # exchanges the Actions OIDC token via id-token: write. workflow_dispatch
+    # is allowed so a publish can be re-driven after a partial failure
+    # (master's crate version must match the intended release).
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      id-token: write
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,10 +145,26 @@ jobs:
         with:
           rustflags: ""
 
-      # Retried up to 3 times (crates.io transient 5xx). NOTE on reruns:
-      # crates.io rejects re-uploading an identical version.
+      # crates.io trusted publishing: exchange the workflow's OIDC identity
+      # for a short-lived publish token (cargo does not speak OIDC itself).
+      - name: Resolve the crates.io publish token (trusted publishing)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      # Retried up to 3 times (crates.io transient 5xx). A version already
+      # on crates.io (the partial-failure rerun) skips via the registry
+      # check, so a re-drive never blocks on the identical-version rejection.
       - name: Publish rocket-guard-rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
+          set -o pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          published=$(curl -fsSL -A "rocket-guard-rs release (https://github.com/Guard-Core/rocket-guard-rs)" "https://crates.io/api/v1/crates/rocket-guard-rs" | jq -r .crate.max_version || true)
+          if [ "$published" = "$tag" ]; then
+            echo "rocket-guard-rs $tag is already on crates.io; skipping"
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if cargo publish; then
               exit 0
