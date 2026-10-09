@@ -49,6 +49,18 @@ jobs:
         with:
           rustflags: ""
 
+      # The engine's ReDoS validator verifies untrusted patterns inside a
+      # killable child (the guard-core-engine guard-pattern-probe binary
+      # target), and UserAgentFilter::new validates every blocked_user_agents
+      # entry through that chain. Cargo never builds bin targets of
+      # dependency crates, so the suite cannot find the probe unless this
+      # workflow builds it first (the same step the CI test, coverage, and
+      # msrv jobs run); without it the validator fails with
+      # "probe child binary not found" and valid user-agent config entries
+      # are rejected.
+      - name: Build the pattern-probe child
+        run: cargo build -p guard-core-engine --bins
+
       - name: Run the adapter test suite against guard-core-rs@master
         run: |
           cargo test
