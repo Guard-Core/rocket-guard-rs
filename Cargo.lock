@@ -595,7 +595,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "guard-core-engine"
-version = "4.3.1"
+version = "4.3.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.3.1"
+version = "4.3.2"
 dependencies = [
  "chrono",
  "guard-core-engine",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "rocket-guard-rs"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "chrono",
  "guard-core-engine",
