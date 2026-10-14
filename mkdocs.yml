@@ -1,4 +1,5 @@
 site_name: rocket-guard-rs
+site_url: https://guard-core.github.io/rocket-guard-rs/
 site_description: Application-layer security fairing and guards for Rocket, powered by the guard-core-rs detection engine
 site_author: Renn F
 repo_url: https://github.com/Guard-Core/rocket-guard-rs
