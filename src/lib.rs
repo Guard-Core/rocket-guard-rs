@@ -149,20 +149,74 @@
 //! ## The unified configuration surface
 //!
 //! [`GuardFairing::from_security_config`] builds the whole wired pipeline
-//! from the engine's [`SecurityConfig`] (the reference 129-field
-//! configuration surface) in one fail-closed call: the detection budgets,
-//! the IP lists onto the gate, the rate-limit and ban groups,
-//! `enforce_https`, `emergency_mode` + its whitelist,
-//! `custom_error_responses`/`on_block`, the detection-exclusion group, the
-//! observability group, the ReDoS-validated `blocked_user_agents`, and the
-//! security-headers/CORS/behavior response pass. The reference
-//! `exclude_paths` carve-out rides along as a first-class builder consumed
-//! first in the pipeline (an excluded path bypasses every request-side
-//! check, gate included). Invalid values fail closed through the typed
-//! [`GuardConfigError`]. The stages that need a host-provided collaborator
-//! (the geo handler, the distributed stores, the event bus, the custom
-//! checks, the time-window and referrer resolvers) stay opt-in through
-//! their own builders.
+//! from the engine's [`SecurityConfig`] (the reference configuration
+//! surface) through the facade's [`Wiring`], the one mapping every Rust
+//! adapter shares (the field-by-field table is in the
+//! [`guard_core_rs::wiring`] module docs). Geo country rules and
+//! `geo_ip_handler`, `block_cloud_providers` (with the per-request range
+//! refresh), `endpoint_rate_limits`, the rate-limit auto-ban,
+//! `custom_request_check`, `auth_verifier` (the fallback of a route's
+//! verifiers), `custom_response_modifier`, `on_error`, `cors_expose_headers`,
+//! the telemetry sink, the event bus and the dynamic rules all land on the
+//! fairing. Invalid values fail closed through the typed
+//! [`GuardConfigError`]. [`GuardFairing::from_security_config_with`] takes
+//! the collaborators a config cannot carry: the telemetry agent (any
+//! [`TelemetryHandler`], for example guard-agent-rs's `GuardAgentTelemetry`
+//! built from the `agent_*` fields) and the Logfire client. Wiring starts
+//! nothing: [`GuardFairing::telemetry`] exposes the fan-out for the host to
+//! `start()` / `stop()`, and [`GuardFairing::spawn_dynamic_rules`] starts the
+//! dynamic-rule poll loop. `route_resolution_strict` is not applied (Rocket
+//! resolves routes after `on_request`) and stays on the config.
+//!
+//! ## Client resolution
+//!
+//! The identity every stage runs under (gate, bans, rate limit, geo, cloud,
+//! events, the response pass) is resolved from the connecting peer with the
+//! reference rules: `X-Forwarded-For` counts only behind a trusted proxy
+//! (`trusted_proxies`, `trusted_proxy_depth`) and an IPv4-mapped IPv6 peer
+//! is canonicalized. Rocket's own `Request::client_ip()` is never used: it
+//! honors the `X-Real-IP` header from any peer. A request with no peer and
+//! no resolvable client answers `403 Client address could not be
+//! determined` under `fail_secure` (check name `client_address_unresolved`
+//! on the `on_block` hook) before any check, and continues unattributed
+//! under `fail_secure = false`. A bare fairing defaults to no proxies and
+//! `fail_secure = false`; [`GuardFairing::with_client_policy`] installs a
+//! [`ClientPolicy`] and `from_security_config` installs the config's
+//! (`fail_secure` defaults to `true`). The HTTPS stage matches
+//! `trusted_proxies` against the connecting peer and takes the transport's
+//! own scheme, so a forged `X-Forwarded-Proto` does not skip the redirect.
+//!
+//! ## Excluded paths and bypassed routes
+//!
+//! `exclude_paths` uses the reference matcher: `/static` covers `/static`
+//! and `/static/app.js` (never `/staticx`) and percent-encoding and dot
+//! segments are resolved before matching. An excluded request is scoped,
+//! not bypassed: it carries [`GuardExclusionScoped`] and runs route
+//! resolution, the ban check, the global IP lists, country and cloud rules
+//! and the rate limit. Emergency mode, HTTPS enforcement, request logging,
+//! headers and auth, validators, the scan (the [`GuardBody`] body scan
+//! included, its size cap stays as the memory bound), the user-agent
+//! filter, custom checks and the return rules are skipped. The response
+//! still gets the metrics, security headers, CORS and the modifier. The CORS
+//! preflight short-circuit runs before the exclusion decision. A route
+//! carrier that bypasses `all` checks emits the `security_bypass` event,
+//! runs no check and gets only the response modifier (under `passive_mode`
+//! it continues through the pipeline). Rocket cannot answer from
+//! `on_request`, so every refusal here rides the same verdict, guard and
+//! catcher path as any other block.
+//!
+//! ## The response pass
+//!
+//! The modifier of the processor (from the config) and the fairing's
+//! ([`GuardFairing::with_custom_response_modifier`]) each run once, and the
+//! fairing's runs even without a processor. Body `return_pattern` rules
+//! read the response body: when a rule needs it
+//! (`behavior_scan_response_body`) the response body is buffered in full
+//! (bounded in time by `body_read_timeout`; a read error or timeout answers
+//! the fail-secure `500`) and re-emitted intact, and the first
+//! `behavior_max_response_body_inspect_bytes` bytes are what the rules read.
+//! Status-only rules never buffer; do not combine body rules with endless
+//! streaming responses.
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family)

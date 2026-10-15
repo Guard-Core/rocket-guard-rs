@@ -8,8 +8,8 @@ rocket-guard-rs is the Rocket adapter for the Guard ecosystem. It screens Rocket
 - **Repository**: https://github.com/Guard-Core/rocket-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
-- **Version**: 1.1.0 (published to crates.io)
-- **Status**: implemented, tested, and published. The engine is a path dependency into a sibling `guard-core-rs` checkout; note the crates.io yank below (see [Engine Dependency](#engine-dependency)).
+- **Version**: 1.5.0 (published to crates.io)
+- **Status**: implemented, tested, and published. The engine is a path dependency into a sibling `guard-core-rs` checkout (see [Engine Dependency](#engine-dependency)).
 
 ## Ecosystem Position
 
@@ -32,6 +32,15 @@ Rocket has no middleware chain that can abort a request: `on_request` in a fairi
 2. **Guard arguments on protected routes**: `BlockGuard` for routes without a body, `GuardBody` for routes with one (it buffers up to the cap, scans the body view, and hands the bytes to the handler in one step, because Rocket's `Data` is a one-shot stream).
 
 A route without a guard argument is scanned but never blocked; that is Rocket's own per-route opt-in model. Fail-secure rule: a guard that cannot find a stashed verdict refuses with `500` rather than passing uninspected. The body view is never scanned by the fairing: a truncated scan would be a bypass vector.
+
+## Pipeline and config surface
+
+`GuardFairing::from_security_config(&config)` (and `from_security_config_with(&config, &WiringOptions)` for the injected telemetry agent) builds the whole pipeline through the facade's `Wiring`, the one `SecurityConfig` mapping the Rust adapters share; the adapter installs each part on its builder and owns only the seams the wiring leaves on `Wiring::config` (`fail_secure`, `trusted_proxies`, `exclude_paths`, `auth_verifier`, `body_read_timeout`). `route_resolution_strict` is not applied (Rocket resolves routes after `on_request`).
+
+- **Client identity**: resolved once per request in `on_request` from the connecting peer (`Request::remote()`) and `X-Forwarded-For` through the trusted proxies, stashed in a request-local slot and read by every stage, the guards and the response pass. Rocket's `client_ip()` is never used (it trusts `X-Real-IP`). `fail_secure` rejects a peer-less request with the `client_address_unresolved` block.
+- **`exclude_paths`**: the engine's `PathExclusions` matcher; an excluded request is scoped (route resolution, bans, the global IP rules, the rate limit), carries the public `GuardExclusionScoped` marker and gets the scoped response pass. A route that bypasses `all` emits `security_bypass` and gets only the modifier.
+- **Response pass**: the processor from the wiring (shared ban manager) plus the fairing-level modifier, which runs even without a processor. `return_pattern` body rules buffer the response body in `on_response` (bounded by `body_read_timeout`, a failure answers `500`) and re-emit it intact.
+- **Refusals**: Rocket cannot answer from `on_request`, so every block, including the new ones, is a verdict stashed in request-local state, enforced by the guards and rendered by the catchers or the `404` rewrite.
 
 ## Engine Integration
 
@@ -56,14 +65,13 @@ The method is not scanned: `detect` has no method parameter. Non-UTF-8 header va
 
 ## Engine Dependency
 
-- `Cargo.toml` pins `guard-core-engine` and `guard-core-rs` at 4.1.0 with paths into the sibling checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`).
-- Registry note, stated plainly: the 4.1.0 dists of `guard-core-engine` and `guard-core-rs` are currently yanked on crates.io, so the published 1.1.0 of this crate cannot resolve its engine from the registry alone (a fresh `cargo add rocket-guard-rs` falls back to 1.0.0 with engine 4.0.4). Resolution is restored at the synchronized 4.2.0 train; until then the sibling path dependencies are the working route.
+- `Cargo.toml` pins `guard-core-engine` and `guard-core-rs` at 4.3.2 (the floor) with paths into the sibling checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`). The unreleased parity work needs the engine's `PathExclusions` and `resolve_client` and the facade's `Wiring`, so it trains with the next engine release.
 - The engine crate is used directly for `detect`; the facade dependency supplies the pipeline-side modules (events, geo, cloud provider, responses, and the rate-limit/ban stage wiring). The facade re-exports the full engine stage set since 4.1.0.
 - CI checks out `Guard-Core/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
 
 ## Development Commands
 
-CI is the source of truth (`.github/workflows/*.yml`); there is no Makefile.
+CI is the source of truth (`.github/workflows/*.yml`); the Makefile wraps the same commands over the whole workspace (`make test`, `make lint`).
 
 ```bash
 cargo check --all-targets                              # type check
@@ -121,7 +129,7 @@ rocket-guard-rs/
 
 ## Testing
 
-- `cargo test` runs the unit tests (`src/`), the integration tests (`tests/integration.rs`, Rocket local client), and the doctests. All must pass.
+- `cargo test` runs the unit tests (`src/`), the integration tests (`tests/integration.rs`, Rocket local client), the parity tests (`tests/parity.rs` for the scoped exclusions, client resolution, config consumption and response pass, `tests/parity_api.rs` for the wiring entry points), and the doctests. All must pass, and CI enforces 100% line coverage (`cargo llvm-cov`).
 - Coverage must include: benign passthrough, threats blocked via `BlockGuard` and via `GuardBody`, engine panic to `500` (the `#[cfg(test)]` detector seam), the 404-to-403 rewrite, catcher non-collision, body cap `413`, and per-route opt-in (a route without a guard argument is not blocked).
 - Payloads must come from the spec 4.1.0 conformance corpus (`guard-core-rs/conformance/guard-core-spec-4.1.0/cases/`) so they are guaranteed threats, not guesses.
 
@@ -138,7 +146,7 @@ rocket-guard-rs/
 3. **Run the full local gate before committing**: fmt, clippy, test, doc, cargo deny. CI runs all five.
 4. **Example apps are part of the workspace.** `examples/simple_app` and `examples/advanced_app` build with a plain `cargo build` from the repo root; when you change the adapter's public API or response shapes, update the examples and their READMEs (and re-run the live smoke assertions) in the same change.
 5. **Conventional commits** (`feat:`, `fix:`, `docs:`, `ci:`), matching history. No AI attribution in commit messages.
-6. **Document status honestly.** This crate is published at 1.1.0, but its engine dependency is currently unresolvable from the registry alone (4.1.0 yanked); say so rather than implying a plain `cargo add` works. crates.io publishing is manual and owner-gated; the release workflow only gates the tag.
+6. **Document status honestly.** Describe what the crate does today, not a roadmap, and keep the README, the skill file and the changelog in step with the code. crates.io publishing is manual and owner-gated; the release workflow only gates the tag.
 7. **Keep the engine surface claims honest.** The engine ships the detect pipeline plus the in-memory rate limiter, ban store, geo country rules, cloud provider checks, and distributed store traits (Redis backends are wired by the consumer, not bundled). Do not document capabilities the engine does not expose.
 
 ## Related Projects

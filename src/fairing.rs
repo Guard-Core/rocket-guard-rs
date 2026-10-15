@@ -1033,9 +1033,11 @@ impl GuardFairing {
     /// samples - `request_count`, `response_time` (seconds from the
     /// request reaching the fairing until the response is produced, like
     /// the reference stopping at response start) and, for a `>= 400`
-    /// status, `error_rate`. Guard refusals, the CORS preflight and
-    /// redirect answers, and `exclude_paths` bypasses emit nothing. The
-    /// collector owns the `agent_enable_metrics` gate and the transport.
+    /// status, `error_rate`. An `exclude_paths` request that passes its
+    /// scoped pipeline is counted too (the reference behavior). Guard
+    /// refusals, the CORS preflight and redirect answers, and
+    /// all-checks-bypass routes emit nothing. The collector owns the
+    /// `agent_enable_metrics` gate and the transport.
     #[must_use]
     pub fn with_metrics(mut self, metrics: crate::MetricsCollector) -> Self {
         self.metrics = Some(metrics);
@@ -5609,7 +5611,8 @@ mod stateful_tests {
             .await;
         assert_eq!(response.status(), Status::Ok);
         // The forwarded response still carries the security-header set: the
-        // carve-out bypasses the request-side checks, not the response pass.
+        // carve-out is scoped on the request side, not exempt from the
+        // response pass.
         assert_eq!(
             response.headers().get_one("x-content-type-options"),
             Some("nosniff")
