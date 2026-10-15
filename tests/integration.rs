@@ -350,6 +350,11 @@ fn unauthorized_route() -> Status {
     Status::Unauthorized
 }
 
+#[get("/request-timeout")]
+fn request_timeout_route() -> Status {
+    Status::RequestTimeout
+}
+
 #[tokio::test]
 async fn application_error_statuses_keep_the_minimal_default_bodies() {
     // A `4xx`/`5xx` the application raises itself (clean request, no guard
@@ -367,13 +372,14 @@ async fn application_error_statuses_keep_the_minimal_default_bodies() {
                     service_unavailable_route,
                     server_error_route,
                     unauthorized_route,
+                    request_timeout_route,
                 ],
             ),
     )
     .await
     .expect("valid rocket");
 
-    let expectations: [(&str, Status, &str); 6] = [
+    let expectations: [(&str, Status, &str); 7] = [
         ("/bad-request", Status::BadRequest, "400 Bad Request"),
         ("/forbidden", Status::Forbidden, "403 Forbidden"),
         (
@@ -392,6 +398,11 @@ async fn application_error_statuses_keep_the_minimal_default_bodies() {
             "500 Internal Server Error",
         ),
         ("/unauthorized", Status::Unauthorized, "401 Unauthorized"),
+        (
+            "/request-timeout",
+            Status::RequestTimeout,
+            "408 Request Timeout",
+        ),
     ];
     for (path, status, body) in expectations {
         let response = client.get(path).dispatch().await;

@@ -26,7 +26,7 @@
 //! 1. **Attach [`GuardFairing`]** (`Kind::Ignite | Kind::Request |
 //!    Kind::Response`). Its `on_request` scans the path, query, and header
 //!    views and stashes the verdict in request-local state. Its `on_ignite`
-//!    registers the `400`/`403`/`413`/`429`/`500` catchers that render
+//!    registers the `400`/`403`/`408`/`413`/`429`/`500` catchers that render
 //!    refusals as the
 //!    ecosystem's plain-text error shape (skipping any status the application
 //!    already registered a catcher for, because Rocket treats same-code
@@ -165,8 +165,24 @@
 //! built from the `agent_*` fields) and the Logfire client. Wiring starts
 //! nothing: [`GuardFairing::telemetry`] exposes the fan-out for the host to
 //! `start()` / `stop()`, and [`GuardFairing::spawn_dynamic_rules`] starts the
-//! dynamic-rule poll loop. `route_resolution_strict` is not applied (Rocket
-//! resolves routes after `on_request`) and stays on the config.
+//! dynamic-rule poll loop. The config is validated at construction
+//! ([`GuardConfigError::Config`]) and the stages a dynamic rule can change
+//! are read from the live config on every request. With the `agent` feature
+//! the agent is built from the `agent_*` fields when none is injected
+//! ([`GuardConfigError::Agent`] under `agent_strict`); the `redis` feature
+//! forwards `guard-core-rs/redis`.
+//!
+//! ## Strict routes, request-body timeout and usage rules
+//!
+//! `route_resolution_strict` is decided in `on_response`: Rocket keeps the
+//! last route it tried on the request, so `Request::route()` is `None` only
+//! when the router matched nothing, no handler ran, and the `404` is replaced
+//! with `500 Route resolution failed` (log-only under `passive_mode`).
+//! [`GuardBody`] bounds its body read with `body_read_timeout` and answers
+//! `408 Request body read timed out` (Rocket itself peeks the first 14 bytes
+//! before routing). The route usage rules run after the pipeline passed, from
+//! the guards on success or once in `on_response` for an unguarded route; a
+//! request the pipeline refuses is never counted.
 //!
 //! ## Client resolution
 //!
@@ -229,6 +245,8 @@
 //! hook still prints. `panic = "abort"` in the release profile disables that
 //! recovery, because the process dies before the guard can respond.
 
+#[cfg(feature = "agent")]
+mod agent;
 mod fairing;
 mod guards;
 mod response;
@@ -275,6 +293,7 @@ pub use guard_core_engine::security_config::{
 pub use guard_core_engine::security_headers::SecurityHeadersConfig;
 pub use guard_core_rs::composite::{CompositeAgentHandler, TelemetryHandler};
 pub use guard_core_rs::events::SecurityEventBus;
+pub use guard_core_rs::live::{LiveCell, LiveContext, LiveStages};
 pub use guard_core_rs::metrics::MetricsCollector;
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
 pub use guard_core_rs::tower::{
@@ -370,6 +389,12 @@ pub enum GuardConfigError {
     /// Country rules without a resolver, or the `GeoIP` database could not
     /// be set up.
     Geo(String),
+    /// [`SecurityConfig::validate`] rejected the config (the reference
+    /// validates at construction).
+    Config(SecurityConfigError),
+    /// `enable_agent` with `agent_strict` and the agent could not be built
+    /// from the `agent_*` fields (the `agent` feature).
+    Agent(String),
 }
 
 impl std::fmt::Display for GuardConfigError {
@@ -382,6 +407,8 @@ impl std::fmt::Display for GuardConfigError {
             Self::Cloud(error) => write!(f, "block_cloud_providers: {error}"),
             Self::Redis(message) => write!(f, "redis: {message}"),
             Self::Geo(message) => write!(f, "geo: {message}"),
+            Self::Config(error) => write!(f, "config: {}", error.problems.join("; ")),
+            Self::Agent(message) => write!(f, "agent: {message}"),
         }
     }
 }
@@ -394,7 +421,8 @@ impl std::error::Error for GuardConfigError {
             Self::UserAgent(error) => Some(error),
             Self::Ban(error) => Some(error),
             Self::Cloud(error) => Some(error),
-            Self::Redis(_) | Self::Geo(_) => None,
+            Self::Config(error) => Some(error),
+            Self::Redis(_) | Self::Geo(_) | Self::Agent(_) => None,
         }
     }
 }
@@ -433,6 +461,7 @@ impl From<WiringError> for GuardConfigError {
             WiringError::Cloud(error) => Self::Cloud(error),
             WiringError::Redis(message) => Self::Redis(message),
             WiringError::Geo(message) => Self::Geo(message),
+            WiringError::Config(error) => Self::Config(error),
         }
     }
 }
@@ -492,6 +521,21 @@ mod tests {
         .into();
         assert!(ban.to_string().contains("ip ban"));
         assert!(std::error::Error::source(&ban).is_some());
+    }
+
+    #[test]
+    fn the_config_is_validated_at_construction() {
+        let config = SecurityConfig {
+            auto_ban_threshold: 0,
+            ..SecurityConfig::default()
+        };
+        let error = GuardFairing::from_security_config(&config).expect_err("rejected");
+        assert!(matches!(error, GuardConfigError::Config(_)));
+        assert!(error.to_string().contains("auto_ban_threshold"), "{error}");
+        assert!(std::error::Error::source(&error).is_some());
+        let agent = GuardConfigError::Agent("no runtime".to_owned());
+        assert_eq!(agent.to_string(), "agent: no runtime");
+        assert!(std::error::Error::source(&agent).is_none());
     }
 
     #[test]

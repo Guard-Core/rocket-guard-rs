@@ -1,7 +1,10 @@
 //! The enforcement guards: `BlockGuard` for requests without a body,
 //! `GuardBody` for requests with one.
 
-use crate::scan::{GuardEngine, Verdict, enforce_body_finding, metadata_verdict, record_enforced};
+use crate::scan::{
+    GuardEngine, Verdict, enforce_body_finding, metadata_verdict, record_enforced,
+    usage_rules_verdict,
+};
 use rocket::data::{Data, FromData, Outcome as DataOutcome, ToByteUnit};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
@@ -50,7 +53,20 @@ impl<'r> FromRequest<'r> for BlockGuard {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         match metadata_verdict(request) {
-            Some(Verdict::Clean) => Outcome::Success(Self { _private: () }),
+            Some(Verdict::Clean) => {
+                // The pipeline passed: the route usage rules observe the request now.
+                let banned = request
+                    .rocket()
+                    .state::<GuardEngine>()
+                    .and_then(|engine| usage_rules_verdict(engine, request));
+                match banned {
+                    Some(verdict) => {
+                        record_enforced(request, verdict);
+                        Outcome::Error((verdict.status(), ()))
+                    }
+                    None => Outcome::Success(Self { _private: () }),
+                }
+            }
             verdict => {
                 let enforced = verdict.unwrap_or(Verdict::Failed);
                 record_enforced(request, enforced);
@@ -128,6 +144,7 @@ impl<'r> FromRequest<'r> for GuardExclusionScoped {
 /// | IP gate denial, live ban | `403 Forbidden` | `Forbidden` / `IP address banned` |
 /// | Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
 /// | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
+/// | Body not fully read within `body_read_timeout` | `408 Request Timeout` | `Request body read timed out` |
 /// | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
 #[derive(Debug)]
 pub struct GuardBody {
@@ -176,7 +193,16 @@ impl<'r> FromData<'r> for GuardBody {
         // The route's `max_request_size` replaces the global cap for the
         // route (stashed by the fairing's `on_request` pass).
         let cap = crate::scan::route_body_cap(request).unwrap_or(engine.body_cap);
-        let capped = data.open((cap as u64).bytes()).into_bytes().await;
+        // The reference `body_read_timeout`: a body that does not arrive in
+        // time is refused `408`, never forwarded unread (fail-secure).
+        let read = data.open((cap as u64).bytes()).into_bytes();
+        let capped = match engine.body_read_timeout {
+            Some(limit) => match rocket::tokio::time::timeout(limit, read).await {
+                Ok(capped) => capped,
+                Err(_) => return refused(request, Verdict::BodyTimeout, Status::RequestTimeout),
+            },
+            None => read.await,
+        };
         let bytes = match capped {
             Ok(capped) if capped.is_complete() => capped.into_inner(),
             // The cap was hit: the engine would only ever see a truncated
@@ -212,6 +238,12 @@ impl<'r> FromData<'r> for GuardBody {
         }))
         .unwrap_or(Verdict::Failed);
 
+        // The pipeline and the body scan passed: the route usage rules observe the request now.
+        let verdict = if verdict == Verdict::Clean {
+            usage_rules_verdict(engine, request).unwrap_or(Verdict::Clean)
+        } else {
+            verdict
+        };
         match verdict {
             Verdict::Clean => DataOutcome::Success(Self { bytes }),
             verdict => refused(request, verdict, verdict.status()),

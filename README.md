@@ -278,7 +278,9 @@ The Rocket peer address is the connecting peer. The identity every stage runs un
 
 `GuardFairing::from_security_config(&config)` builds everything through the facade's `Wiring`, the one `SecurityConfig` mapping the Rust adapters share (the field-by-field table is in the `guard_core_rs::wiring` module docs). Geo country rules, cloud providers (with the per-request range refresh), `endpoint_rate_limits`, the rate-limit auto-ban, `custom_request_check`, `auth_verifier` (the fallback of a route's verifiers), `custom_response_modifier`, `on_error`, `cors_expose_headers`, `trusted_proxies` and the rest all land on the fairing. The response processor shares the ban manager with the ban stage, so a return-rule `ban` is enforced by the next request.
 
-The telemetry agent is injected: build a `TelemetryHandler` from the `agent_*` fields with guard-agent-rs's `GuardAgentTelemetry` and call `GuardFairing::from_security_config_with(&config, &WiringOptions { agent: Some(agent), logfire_client: None })`. The agent feeds the event bus, the metrics collector, `agent_stats()` and the dynamic rules. Wiring starts nothing: call `fairing.telemetry()` and its `start()` / `stop()`, and `fairing.spawn_dynamic_rules()` starts the poll loop (drop the handle to stop it). Body `return_pattern` rules buffer the response body (bounded in time by `body_read_timeout`, a read error or timeout answers `500`) and re-emit it intact, so do not combine them with endless streaming responses.
+The config is validated at construction (`SecurityConfig::validate`), and the stages a dynamic rule can change (geo, cloud, user agent, emergency mode, the penetration toggle, the rate limit and ban knobs) are read from the live config on every request, so a landed rule takes effect without a rebuild. A fairing built through the builder API (no config) keeps its static stages. Because the live rate-limit stage is built when the application ignites, builder calls made after `from_security_config` still reach it.
+
+The telemetry agent is injected, or built from the config with the `agent` cargo feature. Without the feature, build a `TelemetryHandler` from the `agent_*` fields with guard-agent-rs's `GuardAgentTelemetry` and call `GuardFairing::from_security_config_with(&config, &WiringOptions { agent: Some(agent), logfire_client: None })`. With `features = ["agent"]` and no injected agent, `enable_agent` plus an `agent_api_key` builds the guard-agent-rs agent from the `agent_*` fields on the caller's tokio runtime; a failure degrades (`agent_stats()` reports `degraded`) unless `agent_strict` is set, which fails with `GuardConfigError::Agent`. The agent feeds the event bus, the metrics collector, `agent_stats()` and the dynamic rules. Wiring starts nothing: call `fairing.telemetry()` and its `start()` / `stop()`, and `fairing.spawn_dynamic_rules()` starts the poll loop (drop the handle to stop it). Body `return_pattern` rules buffer the response body (bounded in time by `body_read_timeout`, a read error or timeout answers `500`) and re-emit it intact, so do not combine them with endless streaming responses.
 
 ## Body cap
 
@@ -316,9 +318,19 @@ Every reference check the engine ships is installable on `GuardFairing`, and the
 ## Not wired on purpose
 
 - **WebSocket guard (fairing half)**: the fairing scans an upgrade's path, query, and header views like any request, but the handshake rejection and the per-frame guard live in the `websocket::WebSocketGuard` route surface (described above), not the fairing; a `rocket_ws` route without the guard argument is not WS-guarded.
-- **`route_resolution_strict`**: Rocket resolves routes after the fairing's `on_request`, so the adapter cannot tell an unresolved route apart. The knob stays on the config.
-- **Request-body read timeout**: Rocket's own limits own that seam; `body_read_timeout` bounds the response-body read the return rules need.
-- **The `redis` backend**: the adapter does not enable `guard-core-rs`'s `redis` feature. Enable it in your own `Cargo.toml` and `enable_redis` plus `redis_url` wire the shared stores; otherwise limits and bans stay per process.
+- **Pre-routing refusal of unmatched requests**: Rocket resolves routes after the request fairings, so `route_resolution_strict` cannot refuse in `on_request`. It is decided in `on_response` instead (see below): a request that matched no route answers `500 Route resolution failed`, and the `404` replaced proves no handler ran.
+- **Request-body bound before Rocket routes**: Rocket itself reads the first 14 bytes of every body before routing, so `body_read_timeout` bounds the `GuardBody` read, not that initial peek.
+
+## Strict route resolution, body timeout and usage rules
+
+- **`route_resolution_strict`**: Rocket keeps the last route it tried on the request, so `Request::route()` is `None` exactly when the router found no matching route (path, method, format and query all considered). The fairing checks that in `on_response`: with the knob set the answer is replaced with `500 Route resolution failed` (the `route_unresolved` event and the `on_block` hook fire, and `custom_error_responses` for `500` applies); under `passive_mode` it only logs. A route that matched and forwarded (for example a guard that forwards) is not unresolved. `GuardFairing::with_route_resolution_strict` sets it on a builder-built fairing.
+- **`body_read_timeout` for the request body**: `GuardBody` bounds its body read with the config's `body_read_timeout` (seconds) and answers `408 Request body read timed out` when the body does not arrive in time. The unread body is never forwarded.
+- **Route usage rules** (`process_usage_rules`) run after the whole pipeline passed, not before it: a request the pipeline or a guard refuses is not counted, and neither is an excluded, bypassed or unattributed (no client ip) request. Rocket has no single point just before the handler, so `BlockGuard` and `GuardBody` run the rules when they succeed (after the body scan for `GuardBody`), and a route without a guard argument runs them once in `on_response`.
+
+## Cargo features
+
+- **`redis`**: forwards `guard-core-rs/redis`, so `enable_redis` plus `redis_url` build the shared rate-limit and ban stores. Without it limits and bans stay per process.
+- **`agent`**: builds the telemetry agent from the `agent_*` config fields (optional `guard-agent-rs` and a tokio runtime handle). See the config section above.
 
 ## Development
 
