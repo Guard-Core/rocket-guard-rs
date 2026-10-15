@@ -139,6 +139,10 @@ pub struct GuardFairing {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the fairing touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `MetricsCollector` the forwarded-response path feeds
+    /// (`collect_request_metrics`: request count, response time, error
+    /// rate); `None` emits nothing.
+    metrics: Option<crate::MetricsCollector>,
     /// The reference `exclude_paths`: request paths that bypass the whole
     /// pipeline (the docs/static carve-out).
     exclude_paths: Vec<String>,
@@ -193,6 +197,7 @@ impl GuardFairing {
             cloud_provider: None,
             user_agent: None,
             response_processor: None,
+            metrics: None,
             exclude_paths: Vec::new(),
             route_configs: None,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
@@ -979,6 +984,21 @@ impl GuardFairing {
         self
     }
 
+    /// Install the reference `MetricsCollector` (the `agent_enable_metrics`
+    /// emission point): every response Rocket produces for a request the
+    /// guard let through emits the reference `collect_request_metrics`
+    /// samples - `request_count`, `response_time` (seconds from the
+    /// request reaching the fairing until the response is produced, like
+    /// the reference stopping at response start) and, for a `>= 400`
+    /// status, `error_rate`. Guard refusals, the CORS preflight and
+    /// redirect answers, and `exclude_paths` bypasses emit nothing. The
+    /// collector owns the `agent_enable_metrics` gate and the transport.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: crate::MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Install the response-side pass (the reference `process_response`):
     /// the global `return_pattern` behavior rules evaluate every response
     /// the fairing touches (a crossed `ban` action lands in the
@@ -1108,6 +1128,15 @@ impl Fairing for GuardFairing {
     }
 
     async fn on_request(&self, request: &mut Request<'_>, _data: &mut Data<'_>) {
+        // The response-time clock starts here; the `exclude_paths` bypass
+        // never starts it, so it never emits.
+        let excluded = self
+            .exclude_paths
+            .iter()
+            .any(|path| path == request.uri().path().as_str());
+        if self.metrics.is_some() && !excluded {
+            request.local_cache(|| RequestStart(Some(std::time::Instant::now())));
+        }
         let verdict = self.evaluate(request);
 
         request.local_cache(|| Metadata(Some(verdict)));
@@ -1160,6 +1189,23 @@ impl Fairing for GuardFairing {
             }
         }
 
+        // The reference `collect_request_metrics`: only the forwarded lane
+        // (the request passed the pipeline and no route guard refused it)
+        // emits, once the response is produced (the response time stops at
+        // response start).
+        if let Some(metrics) = &self.metrics
+            && metadata_verdict(request) == Some(Verdict::Clean)
+            && crate::scan::enforced_verdict(request).is_none()
+            && let Some(started) = request.local_cache(|| RequestStart(None)).0
+        {
+            metrics.collect_request_metrics(
+                request.uri().path().as_str(),
+                request.method().as_str(),
+                Some(started.elapsed().as_secs_f64()),
+                response.status().code,
+            );
+        }
+
         // The response-side pass (behavioral return rules + security
         // headers + CORS) on every response the fairing touches.
         if let Some(processor) = &self.response_processor {
@@ -1210,6 +1256,12 @@ impl Fairing for GuardFairing {
         }
     }
 }
+
+/// Request-local slot holding the instant the request reached the fairing
+/// (`None` when the request never starts the clock: no collector installed
+/// or the `exclude_paths` bypass).
+#[derive(Debug, Clone, Copy)]
+struct RequestStart(Option<std::time::Instant>);
 
 /// The `RequestBits.client_ip` mapping: the connection's IP when it carries
 /// one, the empty string otherwise (a request served over a unix-socket
@@ -4550,6 +4602,130 @@ mod stateful_tests {
         )
         .await;
         assert_eq!(status, Status::BadRequest);
+    }
+
+    // --- per-request metrics (the reference `collect_request_metrics`) ---
+
+    type SeenMetrics = Arc<Mutex<Vec<guard_core_rs::metrics::SecurityMetric>>>;
+
+    fn recording_metrics(enabled: bool) -> (guard_core_rs::metrics::MetricsCollector, SeenMetrics) {
+        let seen: SeenMetrics = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let collector = guard_core_rs::metrics::MetricsCollector::new(enabled).with_handler(
+            Arc::new(move |metric: &guard_core_rs::metrics::SecurityMetric| {
+                sink.lock().expect("sink").push(metric.clone());
+            }),
+        );
+        (collector, seen)
+    }
+
+    fn metric_summary(seen: &SeenMetrics) -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<(String, Option<String>)> = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .map(|metric| {
+                (
+                    metric.metric_type.clone(),
+                    metric.tags.get("status").cloned(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[get("/boom")]
+    fn boom() -> Status {
+        Status::ServiceUnavailable
+    }
+
+    async fn dispatch_status(fairing: GuardFairing, path: &str) -> Status {
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful, boom]),
+        )
+        .await
+        .expect("valid rocket");
+        client
+            .get(path)
+            .remote(peer("203.0.113.9"))
+            .dispatch()
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_request_emits_count_and_response_time() {
+        let (collector, seen) = recording_metrics(true);
+        let fairing = GuardFairing::with_defaults().with_metrics(collector);
+        assert_eq!(dispatch_status(fairing, "/hello").await, Status::Ok);
+        assert_eq!(
+            metric_summary(&seen),
+            vec![
+                ("request_count".to_owned(), None),
+                ("response_time".to_owned(), Some("200".to_owned())),
+            ]
+        );
+        let seen = seen.lock().expect("sink");
+        let time = seen
+            .iter()
+            .find(|metric| metric.metric_type == "response_time")
+            .expect("response_time");
+        assert!(time.value >= 0.0);
+        assert_eq!(
+            time.tags.get("endpoint").map(String::as_str),
+            Some("/hello")
+        );
+        assert_eq!(time.tags.get("method").map(String::as_str), Some("GET"));
+    }
+
+    #[tokio::test]
+    async fn a_5xx_forwarded_response_also_emits_error_rate() {
+        let (collector, seen) = recording_metrics(true);
+        let fairing = GuardFairing::with_defaults().with_metrics(collector);
+        assert_eq!(
+            dispatch_status(fairing, "/boom").await,
+            Status::ServiceUnavailable
+        );
+        assert_eq!(
+            metric_summary(&seen),
+            vec![
+                ("error_rate".to_owned(), Some("503".to_owned())),
+                ("request_count".to_owned(), None),
+                ("response_time".to_owned(), Some("503".to_owned())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_metrics_without_a_collector_or_when_disabled_blocked_or_excluded() {
+        // No collector installed: nothing to emit, the request still passes.
+        assert_eq!(
+            dispatch_status(GuardFairing::with_defaults(), "/hello").await,
+            Status::Ok
+        );
+
+        // `agent_enable_metrics = false` gates inside the collector.
+        let (collector, seen) = recording_metrics(false);
+        let fairing = GuardFairing::with_defaults().with_metrics(collector);
+        dispatch_status(fairing, "/hello").await;
+        assert!(seen.lock().expect("sink").is_empty());
+
+        // A guard block is not a pass-through response.
+        let (collector, seen) = recording_metrics(true);
+        let fairing = GuardFairing::with_defaults().with_metrics(collector);
+        assert_ne!(dispatch_status(fairing, ATTACK_PATH).await, Status::Ok);
+        assert!(seen.lock().expect("sink").is_empty());
+
+        // The `exclude_paths` carve-out bypasses the whole pipeline.
+        let (collector, seen) = recording_metrics(true);
+        let fairing = GuardFairing::with_defaults()
+            .with_exclude_paths(vec!["/hello".to_owned()])
+            .with_metrics(collector);
+        assert_eq!(dispatch_status(fairing, "/hello").await, Status::Ok);
+        assert!(seen.lock().expect("sink").is_empty());
     }
 
     #[tokio::test]
