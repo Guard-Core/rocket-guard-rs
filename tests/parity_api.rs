@@ -176,6 +176,8 @@ impl TelemetryHandler for Sink {
     }
 }
 
+// The agent tests build through the unvalidated wiring seam: the config enables the
+// agent without a key and polls rules below the validated interval.
 fn agent_config() -> SecurityConfig {
     SecurityConfig {
         enable_agent: true,
@@ -204,14 +206,16 @@ fn agent_stats_is_disabled_without_an_agent() {
 #[tokio::test]
 async fn the_injected_agent_receives_the_events_and_metrics() {
     let sink = Arc::new(Sink::default());
-    let fairing = GuardFairing::from_security_config_with(
-        &agent_config(),
-        &WiringOptions {
-            agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
-            logfire_client: None,
-        },
-    )
-    .expect("valid config");
+    let fairing = GuardFairing::from_wiring(
+        Wiring::build_unvalidated(
+            &agent_config(),
+            &WiringOptions {
+                agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
+                logfire_client: None,
+            },
+        )
+        .expect("wired"),
+    );
     assert_eq!(
         fairing.agent_stats(),
         AgentStats {
@@ -240,14 +244,16 @@ fn a_degraded_agent_start_shows_in_the_stats() {
         fail_start: true,
         ..Sink::default()
     });
-    let fairing = GuardFairing::from_security_config_with(
-        &agent_config(),
-        &WiringOptions {
-            agent: Some(sink as Arc<dyn TelemetryHandler>),
-            logfire_client: None,
-        },
-    )
-    .expect("valid config");
+    let fairing = GuardFairing::from_wiring(
+        Wiring::build_unvalidated(
+            &agent_config(),
+            &WiringOptions {
+                agent: Some(sink as Arc<dyn TelemetryHandler>),
+                logfire_client: None,
+            },
+        )
+        .expect("wired"),
+    );
     fairing.telemetry().expect("telemetry").start();
     assert_eq!(
         fairing.agent_stats(),
@@ -266,14 +272,16 @@ fn the_dynamic_rule_poll_loop_is_host_started() {
         dynamic_rule_interval: 1,
         ..agent_config()
     };
-    let fairing = GuardFairing::from_security_config_with(
-        &config,
-        &WiringOptions {
-            agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
-            logfire_client: None,
-        },
-    )
-    .expect("valid config");
+    let fairing = GuardFairing::from_wiring(
+        Wiring::build_unvalidated(
+            &config,
+            &WiringOptions {
+                agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
+                logfire_client: None,
+            },
+        )
+        .expect("wired"),
+    );
     assert_eq!(
         sink.polls.load(Ordering::SeqCst),
         0,
@@ -544,7 +552,7 @@ async fn the_wiring_parts_install_one_by_one_on_a_bare_fairing() {
         block_cloud_providers: Some(["AWS".to_owned()].into_iter().collect()),
         ..agent_config()
     };
-    let wiring = Wiring::from_security_config_with(
+    let wiring = Wiring::build_unvalidated(
         &config,
         &WiringOptions {
             agent: Some(Arc::new(Sink::default()) as Arc<dyn TelemetryHandler>),

@@ -99,6 +99,7 @@ pub struct AgentStats {
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent reference switches, no state machine
 pub struct GuardFairing {
     engine: GuardEngine,
     ip_gate: Option<guard_core_engine::ip_gate::IpGateConfig>,
@@ -155,8 +156,20 @@ pub struct GuardFairing {
     client: ClientPolicy,
     /// The global `auth_verifier`: the fallback of a route's verifiers.
     auth_verifier: Option<guard_core_engine::headers_auth::AuthVerifier>,
-    /// The response-body read bound (`body_read_timeout`).
+    /// The `body_read_timeout` bound: the request-body read of
+    /// [`crate::GuardBody`] (`408`) and the response-body read the
+    /// `return_pattern` rules need (`500`).
     body_read_timeout: Option<Duration>,
+    /// `route_resolution_strict`: a request that matched no route is
+    /// answered `500 Route resolution failed` (see `on_response`).
+    route_resolution_strict: bool,
+    /// The agent init failed and `agent_strict` was off (the reference
+    /// `agent_degraded`).
+    agent_degraded: bool,
+    /// The live-config source (a fairing built from a `SecurityConfig`);
+    /// `on_ignite` builds the cell from it so every builder call made after
+    /// `from_wiring` (event bus, hooks, passive mode) reaches the live stage.
+    live_context: Option<crate::LiveContext>,
     /// The telemetry fan-out `agent_stats` reports on.
     telemetry: Option<Arc<guard_core_rs::composite::CompositeAgentHandler>>,
     /// The dynamic-rule driver (host-started).
@@ -223,6 +236,9 @@ impl GuardFairing {
             },
             auth_verifier: None,
             body_read_timeout: None,
+            route_resolution_strict: false,
+            agent_degraded: false,
+            live_context: None,
             telemetry: None,
             dynamic_rules: None,
             cloud_refresh_gate: None,
@@ -343,13 +359,28 @@ impl GuardFairing {
         self
     }
 
-    /// Bound the response-body read the `return_pattern` body rules need
-    /// (`body_read_timeout`). A body that does not arrive in time answers
-    /// the fail-secure `500`, because the consumed stream cannot be
-    /// replayed.
+    /// Bound the body reads (`body_read_timeout`). A request body
+    /// [`crate::GuardBody`] does not receive in time is refused `408 Request
+    /// body read timed out` (never forwarded unread). A response body the
+    /// `return_pattern` rules need that does not arrive in time answers the
+    /// fail-secure `500`, because the consumed stream cannot be replayed.
     #[must_use]
     pub fn with_body_read_timeout(mut self, timeout: Duration) -> Self {
         self.body_read_timeout = Some(timeout);
+        self
+    }
+
+    /// Set `route_resolution_strict` (the reference `RouteConfigCheck`): a
+    /// request that matched no route is answered `500 Route resolution
+    /// failed` (a logged event under `passive_mode`). Rocket resolves routes
+    /// after the request fairings, so the fairing decides in `on_response`:
+    /// Rocket keeps the last route it tried on the request, so
+    /// [`Request::route`] is `None` exactly when the router found no
+    /// matching route (path, method, format and query all considered), no
+    /// handler ran, and the answer is a `404` the fairing can replace.
+    #[must_use]
+    pub const fn with_route_resolution_strict(mut self, strict: bool) -> Self {
+        self.route_resolution_strict = strict;
         self
     }
 
@@ -382,17 +413,22 @@ impl GuardFairing {
     ///
     /// Fields the adapter reads itself: `fail_secure`, `trusted_proxies` and
     /// `trusted_proxy_depth` (the client policy), `exclude_paths`,
-    /// `auth_verifier` (the fallback of a route's verifiers) and
-    /// `body_read_timeout` (the response-body read). `route_resolution_strict`
-    /// is not applied: Rocket resolves routes after the fairing's
-    /// `on_request`, so the adapter cannot tell an unresolved route apart.
-    /// The `agent_*` transport knobs configure the agent the host injects,
-    /// see [`GuardFairing::from_security_config_with`].
+    /// `auth_verifier` (the fallback of a route's verifiers),
+    /// `body_read_timeout` (the [`crate::GuardBody`] request-body read and
+    /// the response-body read) and `route_resolution_strict` (decided in
+    /// `on_response`, see [`GuardFairing::with_route_resolution_strict`]).
+    /// The stages a dynamic rule can change (geo, cloud, user agent,
+    /// emergency mode, the penetration toggle, the rate limit and ban knobs)
+    /// are read from the live config on every request. With the `agent`
+    /// feature the telemetry agent is built from the `agent_*` fields
+    /// (see [`GuardFairing::from_security_config_with`]).
     ///
     /// # Errors
     ///
-    /// [`crate::GuardConfigError`] when an engine constructor rejects a
-    /// value (an invalid IP/CIDR list entry, a zero rate-limit knob, a
+    /// [`crate::GuardConfigError`] when the config fails
+    /// `SecurityConfig::validate` (the reference validates at construction)
+    /// or an engine constructor rejects a value (an invalid IP/CIDR list
+    /// entry, a zero rate-limit knob, a
     /// ReDoS-unsafe blocked user-agent pattern, an unknown cloud provider,
     /// country rules without a resolver, or a Redis misconfiguration).
     pub fn from_security_config(
@@ -403,11 +439,14 @@ impl GuardFairing {
 
     /// [`GuardFairing::from_security_config`] with the collaborators the
     /// config cannot carry: the telemetry agent (any
-    /// [`TelemetryHandler`](guard_core_rs::composite::TelemetryHandler);
-    /// build one from the `agent_*` fields with guard-agent-rs's
-    /// `GuardAgentTelemetry`) and the Logfire client. The agent feeds the
-    /// event bus, the metrics collector, `agent_stats` and the dynamic
-    /// rules.
+    /// [`TelemetryHandler`](guard_core_rs::composite::TelemetryHandler)) and
+    /// the Logfire client. The agent feeds the event bus, the metrics
+    /// collector, `agent_stats` and the dynamic rules. With the `agent`
+    /// feature and no injected agent, `enable_agent` with an `agent_api_key`
+    /// builds the guard-agent-rs agent from the `agent_*` fields on the
+    /// caller's tokio runtime; a failure degrades (`agent_stats` reports it)
+    /// unless `agent_strict`, which fails with
+    /// [`crate::GuardConfigError::Agent`].
     ///
     /// # Errors
     ///
@@ -417,9 +456,45 @@ impl GuardFairing {
         config: &guard_core_engine::security_config::SecurityConfig,
         options: &WiringOptions,
     ) -> Result<Self, crate::GuardConfigError> {
+        #[cfg(feature = "agent")]
+        if options.agent.is_none() {
+            // The reference builds the agent from the config
+            // (`config.to_agent_config()`); a failure degrades unless
+            // `agent_strict`.
+            match crate::agent::build(config) {
+                Ok(Some(agent)) => {
+                    let mut options = options.clone();
+                    options.agent = Some(agent);
+                    return Self::wired(config, &options);
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    if let Some(hook) = &config.on_error {
+                        hook("agent_init", &message, &std::collections::BTreeMap::new());
+                    }
+                    if config.agent_strict {
+                        return Err(crate::GuardConfigError::Agent(message));
+                    }
+                    return Ok(Self::wired(config, options)?.with_agent_degraded());
+                }
+            }
+        }
+        Self::wired(config, options)
+    }
+
+    fn wired(
+        config: &guard_core_engine::security_config::SecurityConfig,
+        options: &WiringOptions,
+    ) -> Result<Self, crate::GuardConfigError> {
         Ok(Self::from_wiring(Wiring::from_security_config_with(
             config, options,
         )?))
+    }
+
+    #[cfg(feature = "agent")]
+    fn with_agent_degraded(mut self) -> Self {
+        self.agent_degraded = true;
+        self
     }
 
     /// Install every part of a built [`Wiring`]. The parts are public, so a
@@ -456,6 +531,7 @@ impl GuardFairing {
             events,
             metrics,
             dynamic_rules,
+            live: live_context,
             ..
         } = wiring;
         let mut fairing = Self::new(detect)
@@ -467,7 +543,11 @@ impl GuardFairing {
             .with_https_enforcement(https)
             .with_custom_error_responses(custom_error_responses);
         fairing.auth_verifier.clone_from(&config.auth_verifier);
-        fairing.body_read_timeout = Duration::try_from_secs_f64(config.body_read_timeout).ok();
+        // An unrepresentable value keeps the reference default (3 s).
+        fairing.body_read_timeout = Some(
+            Duration::try_from_secs_f64(config.body_read_timeout).unwrap_or(Duration::from_secs(3)),
+        );
+        fairing.route_resolution_strict = config.route_resolution_strict;
         fairing.on_block = on_block;
         fairing.observability = observability;
         fairing.geo_handler = geo_handler;
@@ -502,7 +582,33 @@ impl GuardFairing {
                 )
                 .with_distributed_ban_store(distributed.ban_store);
         }
+        fairing.live_context = Some(live_context);
         fairing
+    }
+
+    /// The live-config cell: the rate-limit stage and the stages a dynamic
+    /// rule can change are rebuilt from the live config when a rule lands
+    /// (see `guard_core_rs::live`). Built at `on_ignite`, over the fairing as
+    /// finally configured, and cloned into the managed engine so every
+    /// request and guard reads it. `None` for a fairing built through the
+    /// builder API (no config), whose stages stay static.
+    fn build_live_cell(
+        &self,
+    ) -> Option<Arc<guard_core_rs::live::LiveCell<crate::scan::RocketLive>>> {
+        let context = self.live_context.as_ref()?;
+        let snapshot = self.clone();
+        let counters = self
+            .engine
+            .ban_state
+            .as_ref()
+            .map_or_else(ViolationCounters::new, |state| state.counters.clone());
+        context
+            .cell(move |stages| crate::scan::RocketLive {
+                stages: Arc::clone(stages),
+                rate_stage: Arc::new(snapshot.build_live_stage(stages, &counters)),
+            })
+            .ok()
+            .map(Arc::new)
     }
 
     /// Install the global IP gate: a `whitelist`/`blacklist`/`exempt_ips`
@@ -1007,11 +1113,11 @@ impl GuardFairing {
         self.telemetry.as_ref().map_or(
             AgentStats {
                 enabled: false,
-                degraded: false,
+                degraded: self.agent_degraded,
             },
             |telemetry| AgentStats {
                 enabled: true,
-                degraded: telemetry.degraded(),
+                degraded: self.agent_degraded || telemetry.degraded(),
             },
         )
     }
@@ -1079,17 +1185,50 @@ impl GuardFairing {
             },
             |state| state.config.clone(),
         );
+        self.stage_over(
+            rate_limit,
+            ip_ban,
+            self.engine.rate_limiter.as_deref().cloned(),
+            self.engine
+                .ban_state
+                .as_ref()
+                .map(|state| (state.manager.clone(), state.counters.clone())),
+        )
+    }
+
+    /// The same stage over the live stages: the limiter and the ban knobs a
+    /// dynamic rule changed, sharing the recorded windows and the ban store.
+    fn build_live_stage(
+        &self,
+        live: &crate::LiveStages,
+        counters: &ViolationCounters,
+    ) -> RateLimitStage {
+        self.stage_over(
+            live.rate_limit.clone(),
+            live.ip_ban.clone(),
+            Some(live.rate_limiter.clone()),
+            Some((live.bans.clone(), counters.clone())),
+        )
+    }
+
+    fn stage_over(
+        &self,
+        rate_limit: RateLimitConfig,
+        ip_ban: IpBanConfig,
+        limiter: Option<RateLimiter>,
+        bans: Option<(IpBanManager, ViolationCounters)>,
+    ) -> RateLimitStage {
         let mut builder = RateLimitStage::builder(RateLimitStageConfig {
             rate_limit,
             ip_ban,
             passive_mode: self.passive_mode,
             custom_error_responses: self.custom_error_responses.clone(),
         });
-        if let Some(limiter) = &self.engine.rate_limiter {
-            builder = builder.limiter(limiter.as_ref().clone());
+        if let Some(limiter) = limiter {
+            builder = builder.limiter(limiter);
         }
-        if let Some(state) = &self.engine.ban_state {
-            builder = builder.ban_manager(state.manager.clone(), state.counters.clone());
+        if let Some((manager, counters)) = bans {
+            builder = builder.ban_manager(manager, counters);
         }
         if let Some(resolver) = &self.route_tiers {
             let resolver = std::sync::Arc::clone(resolver);
@@ -1151,6 +1290,9 @@ impl Fairing for GuardFairing {
                 .custom_error_responses
                 .clone_from(&self.custom_error_responses);
             engine.stage = Some(std::sync::Arc::new(self.build_stage()));
+            engine.body_read_timeout = self.body_read_timeout;
+            engine.usage_processor.clone_from(&self.response_processor);
+            engine.live = self.build_live_cell();
             rocket = rocket.manage(engine);
         }
 
@@ -1205,6 +1347,20 @@ impl Fairing for GuardFairing {
             *response = rendered;
             return;
         }
+        // The reference `RouteConfigCheck` (first in the pipeline, so it
+        // wins over every other verdict): `request.route()` is `None` only
+        // when the router found no matching route, so no handler ran and the
+        // answer is a `404` this fairing may replace. See
+        // [`GuardFairing::with_route_resolution_strict`].
+        if self.route_resolution_strict
+            && request.route().is_none()
+            && let Some(refusal) = self.unresolved_route_response(request)
+        {
+            *response = refusal;
+            let pass = crate::scan::pass(request);
+            self.response_pass(request, response, pass).await;
+            return;
+        }
         // The HTTPS redirect renders here: the `301` + `Location` shape.
         // A guard refusal dispatches Rocket's error catchers, and Rocket
         // allows user catchers only for `400`-`599`, so the `301` always
@@ -1231,6 +1387,15 @@ impl Fairing for GuardFairing {
         }
 
         let pass = crate::scan::pass(request);
+
+        // A route without a guard argument never runs the guard-side usage
+        // rules; the reference runs them for every request the pipeline
+        // passed, so they run here (once: a guard that ran them set the flag).
+        if let Some(engine) = request.rocket().state::<GuardEngine>()
+            && crate::scan::enforced_verdict(request).is_none()
+        {
+            let _ = crate::scan::usage_rules_verdict(engine, request);
+        }
 
         // The reference `collect_request_metrics`: only the forwarded lane
         // (the request passed the pipeline and no route guard refused it)
@@ -1460,6 +1625,70 @@ impl GuardFairing {
         )
     }
 
+    /// The reference `RouteConfigCheck._handle_unresolved_route`: the
+    /// `route_unresolved` event, the `on_block` hook, and the `500 Route
+    /// resolution failed` replacement response unless `passive_mode` (log
+    /// only, `None`).
+    fn unresolved_route_response(&self, request: &Request<'_>) -> Option<Response<'static>> {
+        use guard_core_engine::route_config::{
+            UNRESOLVED_ROUTE_CHECK_NAME, UNRESOLVED_ROUTE_MESSAGE, UNRESOLVED_ROUTE_REASON,
+            UNRESOLVED_ROUTE_STATUS,
+        };
+        let ip = client_ip_string(crate::scan::client_ip(request));
+        let sensitive = self
+            .observability
+            .as_ref()
+            .map(|observability| observability.sensitive.clone())
+            .unwrap_or_default();
+        let path = request.uri().path().as_str();
+        if let Some(bus) = &self.events {
+            let mut event = guard_core_rs::events::SecurityEvent::new(
+                guard_core_rs::event_types::EVENT_ROUTE_UNRESOLVED,
+                &ip,
+                if self.passive_mode {
+                    "logged_only"
+                } else {
+                    "request_blocked"
+                },
+                UNRESOLVED_ROUTE_REASON,
+                guard_core_rs::events::MIDDLEWARE_HANDLER_NAME,
+            );
+            event.endpoint = Some(guard_core_rs::redact::redact_url_for_display(
+                path, &sensitive,
+            ));
+            event.method = Some(request.method().as_str().to_owned());
+            bus.send_event(&event);
+        }
+        let observation = crate::scan::request_observation(request);
+        let payload = guard_core_rs::responses::build_block_payload(
+            UNRESOLVED_ROUTE_CHECK_NAME,
+            UNRESOLVED_ROUTE_REASON,
+            "",
+            self.passive_mode,
+            &ip,
+            observation.url.as_deref().unwrap_or("/"),
+            observation.method.as_deref().unwrap_or(""),
+            Some(UNRESOLVED_ROUTE_STATUS),
+            &sensitive,
+        );
+        guard_core_rs::responses::fire_block_hook(self.on_block.as_ref(), &payload);
+        if self.passive_mode {
+            return None;
+        }
+        let body = guard_core_rs::responses::resolve_error_body(
+            &self.custom_error_responses,
+            UNRESOLVED_ROUTE_STATUS,
+            UNRESOLVED_ROUTE_MESSAGE,
+        );
+        Some(
+            Response::build()
+                .status(Status::InternalServerError)
+                .header(rocket::http::ContentType::Plain)
+                .sized_body(body.len(), std::io::Cursor::new(body.into_bytes()))
+                .finalize(),
+        )
+    }
+
     /// The `security_bypass` event of an all-checks-bypass route (the
     /// reference `handle_security_bypass`).
     fn emit_security_bypass_event(
@@ -1565,7 +1794,9 @@ impl GuardFairing {
         engine: &GuardEngine,
         request: &Request<'_>,
         client_ip: Option<std::net::IpAddr>,
+        live: Option<&Arc<crate::scan::RocketLive>>,
     ) -> Verdict {
+        let live = Live::of(self, live);
         if let Some(verdict) = crate::scan::bans_decision(engine, request) {
             return verdict;
         }
@@ -1573,7 +1804,7 @@ impl GuardFairing {
             return verdict;
         }
         let gate = crate::scan::gate_decision(request);
-        if let Some(stage) = &self.geo_blocking
+        if let Some(stage) = live.geo
             && let Some(decision) = stage.decide(client_ip, gate)
         {
             return crate::scan::stage_block(
@@ -1582,7 +1813,7 @@ impl GuardFairing {
                 stage_answer_body(&decision.answer),
             );
         }
-        if let Some(stage) = &self.cloud_provider
+        if let Some(stage) = live.cloud
             && let Some(decision) = stage.decide(client_ip, gate)
         {
             return crate::scan::stage_block(
@@ -1613,6 +1844,9 @@ impl GuardFairing {
             .state::<GuardEngine>()
             .unwrap_or(&self.engine);
         let _ = &self.engine;
+        // The stages a dynamic rule can change, read once for this request.
+        let live_stages = engine.live_now();
+        let live = Live::of(self, live_stages.as_ref());
 
         // The client identity every stage runs under: the connecting peer,
         // `X-Forwarded-For` honored only through the trusted proxies
@@ -1720,7 +1954,7 @@ impl GuardFairing {
         // `enforced_on_excluded_paths` checks): the ban check, the GLOBAL
         // ip rules, then the rate-limit tiers. Everything else is skipped.
         if scoped {
-            return self.evaluate_scoped(engine, request, client_ip);
+            return self.evaluate_scoped(engine, request, client_ip, live_stages.as_ref());
         }
 
         if let Some(size) = route
@@ -1728,36 +1962,6 @@ impl GuardFairing {
             .and_then(|size| usize::try_from(size).ok())
         {
             crate::scan::stash_route_body_cap(request, size);
-        }
-
-        // The reference `process_usage_rules`: the route's usage and
-        // frequency behavior rules track the request observation and a
-        // crossed threshold dispatches the rule's action (a `ban` lands in
-        // the shared ban manager and renders the banned shape). The
-        // behavioral processor runs before the check pipeline (the
-        // reference dispatches it from the middleware's request pass).
-        let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
-            route.map_or(&[], |route| &route.behavior_rules);
-        if !route_rules.is_empty()
-            && let Some(processor) = &self.response_processor
-        {
-            let endpoint_id = format!(
-                "{}:{}",
-                request.method().as_str(),
-                request.uri().path().as_str()
-            );
-            let actions = processor.process_usage_rules(
-                &endpoint_id,
-                &client_ip_string(client_ip),
-                route_rules,
-                std::time::SystemTime::now(),
-            );
-            if actions
-                .iter()
-                .any(guard_core_engine::behavior::BehaviorAction::is_ban)
-            {
-                return Verdict::ActivityBanned;
-            }
         }
 
         // The reference `_check_route_ip_access` (inside the `ip_security`
@@ -1836,7 +2040,7 @@ impl GuardFairing {
         // Check 2: emergency mode (503 outside the whitelist). The
         // reference pipeline never consults the bypass set here: the
         // global stage is not route-bypassable.
-        if let Some(stage) = &self.emergency_mode {
+        if let Some(stage) = live.emergency {
             let ip = client_ip;
             let ip_string = ip.map_or_else(String::new, |addr| addr.to_string());
             if let Some(answer) = stage.decide(
@@ -2134,7 +2338,7 @@ impl GuardFairing {
         // toggle, the `detection_enabled` resolution).
         let metadata = if bypassed("penetration")
             || !guard_core_engine::detection_exclusions::detection_enabled(
-                self.penetration_detection_enabled,
+                live.penetration,
                 route.map(|route| route.enable_suspicious_detection),
             ) {
             None
@@ -2160,9 +2364,7 @@ impl GuardFairing {
         // `_log_country_check_result`): the non-block verdicts ride
         // `log_country_check_level`, blocks ride `log_suspicious_level`
         // (compose-only, like the request-logging stage).
-        if let (Some(observability), Some(stage)) =
-            (self.observability.as_ref(), self.geo_blocking.as_ref())
-        {
+        if let (Some(observability), Some(stage)) = (self.observability.as_ref(), live.geo) {
             let _ = stage.country_check_log(
                 ip,
                 observability.log_suspicious_level,
@@ -2174,7 +2376,7 @@ impl GuardFairing {
         // country whitelist skips it too (`skip_countries`).
         if !bypassed("ip")
             && !skip_global_countries
-            && let Some(stage) = &self.geo_blocking
+            && let Some(stage) = live.geo
             && let Some(decision) = stage.decide(ip, gate)
         {
             return crate::scan::stage_block(
@@ -2204,7 +2406,7 @@ impl GuardFairing {
                 });
             match route_selectors {
                 Some(Ok(selectors)) => {
-                    if let Some(stage) = &self.cloud_provider
+                    if let Some(stage) = live.cloud
                         && let Some(decision) = stage.decide_route(ip, gate, &selectors)
                     {
                         return crate::scan::stage_block(
@@ -2216,7 +2418,7 @@ impl GuardFairing {
                 }
                 Some(Err(_)) => return Verdict::Failed,
                 None => {
-                    if let Some(stage) = &self.cloud_provider
+                    if let Some(stage) = live.cloud
                         && let Some(decision) = stage.decide(ip, gate)
                     {
                         return crate::scan::stage_block(
@@ -2260,7 +2462,7 @@ impl GuardFairing {
                 Some(Err(_)) => return Verdict::Failed,
                 _ => {}
             }
-            if let Some(stage) = &self.user_agent
+            if let Some(stage) = live.user_agent
                 && let Some(answer) = stage.decide(
                     ip,
                     gate,
@@ -2299,6 +2501,38 @@ impl GuardFairing {
         match metadata {
             Some(verdict) => metadata_threat_verdict(engine, request, &verdict),
             None => Verdict::Clean,
+        }
+    }
+}
+
+/// The stages one request reads: the live ones when a dynamic rule can
+/// change them (a fairing built from a `SecurityConfig`), the static ones of
+/// the builder API otherwise.
+struct Live<'a> {
+    geo: Option<&'a GeoStage>,
+    cloud: Option<&'a CloudProviderStage>,
+    user_agent: Option<&'a UserAgentStage>,
+    emergency: Option<&'a EmergencyModeStage>,
+    penetration: bool,
+}
+
+impl<'a> Live<'a> {
+    fn of(fairing: &'a GuardFairing, live: Option<&'a Arc<crate::scan::RocketLive>>) -> Self {
+        match live {
+            Some(live) => Self {
+                geo: live.stages.geo.as_ref(),
+                cloud: live.stages.cloud.as_ref(),
+                user_agent: live.stages.user_agent.as_ref(),
+                emergency: live.stages.emergency.as_ref(),
+                penetration: live.stages.penetration_detection,
+            },
+            None => Self {
+                geo: fairing.geo_blocking.as_ref(),
+                cloud: fairing.cloud_provider.as_ref(),
+                user_agent: fairing.user_agent.as_ref(),
+                emergency: fairing.emergency_mode.as_ref(),
+                penetration: fairing.penetration_detection_enabled,
+            },
         }
     }
 }
@@ -5312,8 +5546,15 @@ mod stateful_tests {
             whitelist: Some(vec![String::from("not-an-ip")]),
             ..crate::SecurityConfig::default()
         };
+        // The validator names the bad list first.
         let error = GuardFairing::from_security_config(&config).unwrap_err();
-        assert!(matches!(error, crate::GuardConfigError::IpGate(_)));
+        assert!(matches!(error, crate::GuardConfigError::Config(_)));
+        // The stage constructor stays the second line of defence for an
+        // unvalidated config.
+        let error = crate::Wiring::build_unvalidated(&config, &crate::WiringOptions::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(error, crate::WiringError::IpGate(_)));
     }
 
     #[tokio::test]
@@ -5516,8 +5757,10 @@ mod stateful_tests {
             detection_max_scan_seconds: 0.0,
             ..crate::SecurityConfig::default()
         };
-        let client =
-            tracked_config(GuardFairing::from_security_config(&spent).expect("valid")).await;
+        // (Below the validated range, so the unvalidated wiring seam builds it.)
+        let wiring = crate::Wiring::build_unvalidated(&spent, &crate::WiringOptions::default())
+            .expect("wired");
+        let client = tracked_config(GuardFairing::from_wiring(wiring)).await;
         let response = client
             .get("/hello")
             .remote(peer_ip([203, 0, 113, 9]))

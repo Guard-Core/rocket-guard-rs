@@ -76,6 +76,9 @@ pub(crate) enum Verdict {
     /// Check 3: the HTTPS-enforcement stage redirected (the `301` target
     /// rides the redirect-target slot).
     HttpsRedirect,
+    /// The request body did not arrive within `body_read_timeout` (the
+    /// `408` shape); the unread body is never forwarded.
+    BodyTimeout,
     /// The engine panicked; fail secure.
     Failed,
 }
@@ -98,6 +101,7 @@ impl Verdict {
                 None => Status::InternalServerError,
             },
             Verdict::HttpsRedirect => Status::MovedPermanently,
+            Verdict::BodyTimeout => Status::RequestTimeout,
             Verdict::Failed => Status::InternalServerError,
         }
     }
@@ -118,6 +122,13 @@ pub(crate) struct Metadata(pub(crate) Option<Verdict>);
 /// the same status (which keeps a minimal default body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Enforced(pub(crate) Option<Verdict>);
+
+/// What the live config rebuilds for the fairing: the engine stages a
+/// dynamic rule can change plus the rate-limit stage built over them.
+pub(crate) struct RocketLive {
+    pub(crate) stages: Arc<guard_core_rs::live::LiveStages>,
+    pub(crate) rate_stage: Arc<RateLimitStage>,
+}
 
 /// The engine entry point, stored once per application in managed state.
 ///
@@ -161,6 +172,13 @@ pub(crate) struct GuardEngine {
     pub(crate) on_block: Option<OnBlockHook>,
     /// The status-to-body overrides (for the adapter-rendered `400`).
     pub(crate) custom_error_responses: crate::CustomErrorResponses,
+    /// The live-config cell (a fairing built from a `SecurityConfig`): the
+    /// stages a dynamic rule can change, rebuilt when a rule lands.
+    pub(crate) live: Option<Arc<guard_core_rs::live::LiveCell<RocketLive>>>,
+    /// `body_read_timeout` for the request-body read of [`crate::GuardBody`].
+    pub(crate) body_read_timeout: Option<std::time::Duration>,
+    /// The response processor the route usage rules dispatch through.
+    pub(crate) usage_processor: Option<Arc<guard_core_rs::process_response::ResponseProcessor>>,
 }
 
 impl GuardEngine {
@@ -183,7 +201,33 @@ impl GuardEngine {
             observability: None,
             on_block: None,
             custom_error_responses: crate::CustomErrorResponses::new(),
+            live: None,
+            body_read_timeout: None,
+            usage_processor: None,
         }
+    }
+
+    /// The live stages for the request in flight (`None` for a fairing
+    /// built through the builder API, whose stages are static).
+    pub(crate) fn live_now(&self) -> Option<Arc<RocketLive>> {
+        self.live.as_ref().map(|cell| cell.get())
+    }
+
+    /// The rate-limit stage in force: the live one when a dynamic rule can
+    /// change it, the static one otherwise.
+    pub(crate) fn stage_now(&self) -> Option<Arc<RateLimitStage>> {
+        match self.live_now() {
+            Some(live) => Some(Arc::clone(&live.rate_stage)),
+            None => self.stage.clone(),
+        }
+    }
+
+    /// The global scan toggle in force (live or static).
+    pub(crate) fn penetration_now(&self) -> bool {
+        self.live_now()
+            .map_or(self.penetration_detection_enabled, |live| {
+                live.stages.penetration_detection
+            })
     }
 
     /// Resolve the per-request detection-exclusion surface: the global
@@ -284,7 +328,7 @@ impl GuardEngine {
         // The global `enable_penetration_detection` toggle: the body
         // phase skips the scan like the metadata phase (the request
         // proceeds clean).
-        if !self.penetration_detection_enabled {
+        if !self.penetration_now() {
             return None;
         }
         let text = String::from_utf8_lossy(bytes);
@@ -465,7 +509,7 @@ pub(crate) fn stage_decision(
     if carrier_bypasses(route_carrier(request).as_deref(), "rate_limit") {
         return None;
     }
-    let stage = engine.stage.as_ref()?;
+    let stage = engine.stage_now()?;
     let finding = finding.map(|verdict| guard_core_rs::tower::ThreatFinding {
         is_threat: true,
         categories: verdict.categories.clone(),
@@ -493,7 +537,7 @@ pub(crate) fn bans_decision(engine: &GuardEngine, request: &Request<'_>) -> Opti
     if carrier_bypasses(route_carrier(request).as_deref(), "ip_ban") {
         return None;
     }
-    let stage = engine.stage.as_ref()?;
+    let stage = engine.stage_now()?;
     let decision =
         stage.decide_bans_observed(client_ip(request), Some(&request_observation(request)))?;
     let (verdict, custom) = verdict_from_stage(&decision);
@@ -524,8 +568,7 @@ pub(crate) fn metadata_threat_verdict(
     verdict: &RequestScanVerdict,
 ) -> Verdict {
     let passive = engine
-        .stage
-        .as_ref()
+        .stage_now()
         .is_some_and(|stage| stage.config().passive_mode);
     if passive {
         return Verdict::Clean;
@@ -570,7 +613,7 @@ pub(crate) fn enforce_body_finding(
     request: &Request<'_>,
     verdict: &RequestScanVerdict,
 ) -> Verdict {
-    let Some(stage) = engine.stage.as_ref() else {
+    let Some(stage) = engine.stage_now() else {
         return Verdict::Threat;
     };
     let finding = guard_core_rs::tower::ThreatFinding {
@@ -628,6 +671,51 @@ pub(crate) fn preflight_answer(
         .lock()
         .expect("preflight slot")
         .clone()
+}
+
+/// Request-local flag: the route usage rules already observed this request.
+struct UsageRan(std::sync::atomic::AtomicBool);
+
+/// The reference `process_usage_rules`, run once per request AFTER the whole
+/// pipeline passed (the reference dispatches it between the pipeline and
+/// `call_next`): the route's usage and frequency behavior rules track the
+/// request observation and a crossed threshold dispatches the rule's action.
+/// `Some(ActivityBanned)` when a `ban` landed. A request the pipeline (or a
+/// route guard) refused, an excluded or bypassed request, a preflight and an
+/// unattributed request (no client ip) never reach it. Rocket has no single
+/// "just before the handler" point, so the route guards call it on success
+/// and `on_response` calls it for a route without a guard (once: the flag;
+/// it must not read the enforced slot, which would pin it empty).
+pub(crate) fn usage_rules_verdict(engine: &GuardEngine, request: &Request<'_>) -> Option<Verdict> {
+    let processor = engine.usage_processor.as_ref()?;
+    let carrier = route_carrier(request)?;
+    let ip = client_ip(request)?;
+    if carrier.behavior_rules.is_empty()
+        || pass(request) != Pass::Full
+        || metadata_verdict(request) != Some(Verdict::Clean)
+        || preflight_answer(request).is_some()
+        || request
+            .local_cache(|| UsageRan(std::sync::atomic::AtomicBool::new(false)))
+            .0
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return None;
+    }
+    let endpoint_id = format!(
+        "{}:{}",
+        request.method().as_str(),
+        request.uri().path().as_str()
+    );
+    processor
+        .process_usage_rules(
+            &endpoint_id,
+            &ip.to_string(),
+            &carrier.behavior_rules,
+            std::time::SystemTime::now(),
+        )
+        .iter()
+        .any(guard_core_engine::behavior::BehaviorAction::is_ban)
+        .then_some(Verdict::ActivityBanned)
 }
 
 /// Request-local slot for the per-route rate-limit tier override (the
@@ -832,6 +920,7 @@ mod tests {
         assert_eq!(Verdict::Banned.status(), Status::Forbidden);
         assert_eq!(Verdict::ActivityBanned.status(), Status::Forbidden);
         assert_eq!(Verdict::RateLimited(30).status(), Status::TooManyRequests);
+        assert_eq!(Verdict::BodyTimeout.status(), Status::RequestTimeout);
         assert_eq!(
             Verdict::RedisUnavailable.status(),
             Status::ServiceUnavailable

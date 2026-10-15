@@ -42,6 +42,10 @@ pub const RATE_LIMITED_MESSAGE: &str = "Too many requests";
 /// Detail message carried by the `413 Payload Too Large` response.
 pub const OVERSIZE_MESSAGE: &str = "Payload too large";
 
+/// Detail message carried by the `408 Request Timeout` response (the
+/// request body did not arrive within `body_read_timeout`).
+pub const BODY_TIMEOUT_MESSAGE: &str = guard_core_engine::request_limits::BODY_READ_TIMEOUT_MESSAGE;
+
 /// Detail message carried by the fail-secure `500 Internal Server Error`
 /// response.
 pub const FAILURE_MESSAGE: &str = "Security check failed";
@@ -62,6 +66,7 @@ pub const EMERGENCY_MESSAGE: &str = "Service temporarily unavailable";
 const DEFAULT_400: &str = "400 Bad Request";
 const DEFAULT_401: &str = "401 Unauthorized";
 const DEFAULT_403: &str = "403 Forbidden";
+const DEFAULT_408: &str = "408 Request Timeout";
 const DEFAULT_429: &str = "429 Too Many Requests";
 const DEFAULT_500: &str = "500 Internal Server Error";
 const DEFAULT_503: &str = "503 Service Unavailable";
@@ -85,6 +90,7 @@ pub fn guard_catchers() -> Vec<Catcher> {
         Catcher::new(400, blocked),
         Catcher::new(401, unauthorized),
         Catcher::new(403, forbidden),
+        Catcher::new(408, body_timeout),
         Catcher::new(413, oversize),
         Catcher::new(429, rate_limited),
         Catcher::new(500, failure),
@@ -147,6 +153,17 @@ fn forbidden<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
         // A stage block's resolved body rides the block-body slot (read
         // above); the plain family default is the fallback.
         _ => DEFAULT_403,
+    };
+    finish(status, message, None)
+}
+
+/// `408` catcher: the body-timeout body when `GuardBody` refused this
+/// request, a minimal default otherwise.
+fn body_timeout<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
+    let message = if enforced_verdict(request) == Some(Verdict::BodyTimeout) {
+        BODY_TIMEOUT_MESSAGE
+    } else {
+        DEFAULT_408
     };
     finish(status, message, None)
 }
@@ -287,6 +304,7 @@ pub(crate) fn verdict_response_plain(verdict: Verdict) -> Response<'static> {
             DEFAULT_403,
         ),
         Verdict::HttpsRedirect => plain_response(Status::MovedPermanently, ""),
+        Verdict::BodyTimeout => plain_response(Status::RequestTimeout, BODY_TIMEOUT_MESSAGE),
         Verdict::Clean | Verdict::Failed => {
             plain_response(Status::InternalServerError, FAILURE_MESSAGE)
         }
@@ -362,6 +380,8 @@ mod tests {
         assert_eq!(response.status(), Status::BadRequest);
         let response = verdict_response_plain(Verdict::AuthRequired);
         assert_eq!(response.status(), Status::Unauthorized);
+        let response = verdict_response_plain(Verdict::BodyTimeout);
+        assert_eq!(response.status(), Status::RequestTimeout);
         let response = verdict_response_plain(Verdict::CustomBlock(418));
         assert_eq!(
             response.status(),
