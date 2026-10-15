@@ -350,13 +350,23 @@ impl GuardFairing {
         // field; clippy calls it needless while the field list is complete.
         #[allow(clippy::needless_update)]
         if !config.excluded_detection_headers.is_empty()
+            || !config.excluded_semantic_detection_headers.is_empty()
             || !config.excluded_detection_params.is_empty()
             || !config.excluded_detection_body_fields.is_empty()
             || !config.enabled_detection_categories.is_empty()
+            || (config.detection_max_scan_seconds
+                - guard_core_engine::scan_budget::DEFAULT_MAX_SCAN_SECONDS)
+                .abs()
+                > f64::EPSILON
         {
             fairing = fairing.with_detection_exclusions(DetectionExclusionConfig {
                 excluded_detection_headers: config
                     .excluded_detection_headers
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_semantic_detection_headers: config
+                    .excluded_semantic_detection_headers
                     .iter()
                     .cloned()
                     .collect(),
@@ -379,6 +389,7 @@ impl GuardFairing {
                             .collect()
                     }),
                 detection_scan_body: Some(config.detection_scan_body),
+                max_scan_seconds: Some(config.detection_max_scan_seconds),
                 ..DetectionExclusionConfig::default()
             });
         }
@@ -5157,6 +5168,72 @@ mod stateful_tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[test]
+    fn from_security_config_semantic_header_exclusions_reach_the_engine_config() {
+        let config = SecurityConfig {
+            excluded_semantic_detection_headers: [String::from("Cookie")].into_iter().collect(),
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            ..crate::SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        let installed = fairing
+            .detection_exclusions
+            .as_ref()
+            .expect("the semantic header set alone installs the block");
+        assert_eq!(
+            installed.excluded_semantic_detection_headers,
+            vec![String::from("Cookie")]
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_scan_time_budget_reaches_the_scan() {
+        let client = tracked_config(
+            GuardFairing::from_security_config(&crate::SecurityConfig::default()).expect("valid"),
+        )
+        .await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the default budget leaves it alone"
+        );
+
+        // A spent cap fails closed: the engine's scan answers a threat even
+        // for a benign request.
+        let spent = SecurityConfig {
+            detection_max_scan_seconds: 0.0,
+            ..crate::SecurityConfig::default()
+        };
+        let client =
+            tracked_config(GuardFairing::from_security_config(&spent).expect("valid")).await;
+        let response = client
+            .get("/hello")
+            .remote(peer_ip([203, 0, 113, 9]))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[test]
+    fn from_security_config_custom_scan_time_cap_alone_installs_the_block() {
+        let config = SecurityConfig {
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            detection_max_scan_seconds: 2.5,
+            ..crate::SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        let installed = fairing
+            .detection_exclusions
+            .as_ref()
+            .expect("the cap installs it");
+        assert_eq!(installed.max_scan_seconds, Some(2.5));
     }
 
     #[tokio::test]
