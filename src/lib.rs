@@ -218,6 +218,7 @@ pub use guard_core_engine::security_config::{
 };
 pub use guard_core_engine::security_headers::SecurityHeadersConfig;
 pub use guard_core_rs::events::SecurityEventBus;
+pub use guard_core_rs::metrics::MetricsCollector;
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
 pub use guard_core_rs::tower::{
     ObservabilityConfig, RateLimitStage, RateLimitStageConfig, RequestObservation, StageResponse,
