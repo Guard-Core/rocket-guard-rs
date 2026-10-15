@@ -1740,8 +1740,10 @@ impl GuardFairing {
         client_ip: Option<std::net::IpAddr>,
     ) -> Option<Verdict> {
         let gate = self.ip_gate.as_ref()?;
-        let ip = client_ip?;
-        match gate.evaluate(ip) {
+        // No client address is the reference `UNKNOWN_CLIENT_IDENTITY`: a
+        // configured whitelist denies it, otherwise it passes unattributed.
+        let verdict = client_ip.map_or_else(|| gate.evaluate_unknown(), |ip| gate.evaluate(ip));
+        match verdict {
             IpGateVerdict::Denied(denial) => {
                 // The reference `ip_filter` block path: passive mode logs
                 // the crossing and forwards (no verdict is stashed and no
@@ -1752,7 +1754,10 @@ impl GuardFairing {
                 if self.passive_mode {
                     return None;
                 }
-                let ip_string = ip.to_string();
+                let ip_string = client_ip.map_or_else(
+                    || guard_core_rs::geo::UNKNOWN_CLIENT_IP.to_owned(),
+                    |ip| ip.to_string(),
+                );
                 // With no override the catcher's verdict arm renders the
                 // family default itself.
                 if let Some(custom) = engine.custom_error_responses.get(&403) {
@@ -1776,7 +1781,9 @@ impl GuardFairing {
                 Some(Verdict::IpBlocked)
             }
             IpGateVerdict::Allowed(decision) => {
-                record_gate_decision(request, decision);
+                if client_ip.is_some() {
+                    record_gate_decision(request, decision);
+                }
                 None
             }
         }
@@ -1966,67 +1973,52 @@ impl GuardFairing {
 
         // The reference `_check_route_ip_access` (inside the `ip_security`
         // block, before the global lists): the route's `ip_whitelist` /
-        // `ip_blacklist` decide first - a configured whitelist takes over
-        // the route verdict (a match passes, a miss denies), then the
-        // blacklist denies. A configured whitelist also overrides the
-        // global IP lists for the request
-        // (`_route_overrides_ip_lists` / `skip_ip_lists`), so the global
-        // gate is skipped and the skip flags stay unset. An invalid list
-        // entry fails secure (the reference validates at decoration time;
-        // the carrier's invalid entry rides the family's fail-secure arm).
+        // `ip_blacklist` and its country rules (`blocked_countries` /
+        // `whitelist_countries`, the reference `check_country_access`)
+        // decide together. A configured whitelist takes over the IP
+        // verdict (a match passes, a miss denies), then the blacklist
+        // denies; the country verdict is combined with it (false if either
+        // is false, true if either is true), so a whitelist match never
+        // overrides a blocked country. The unknown identity (no resolvable
+        // client address) is denied when the route configures an
+        // `ip_whitelist` or a `whitelist_countries`. A configured route
+        // whitelist also overrides the global IP lists for the request
+        // (`_route_overrides_ip_lists` / `skip_ip_lists`), and a matching
+        // route country whitelist skips the global geo stage
+        // (`skip_countries`). An invalid list entry fails secure (the
+        // reference validates at decoration time; the carrier's invalid
+        // entry rides the family's fail-secure arm).
         let mut skip_global_ip_lists = false;
+        let mut skip_global_countries = false;
         if !bypassed("ip")
             && let Some(route) = route
-            && (route.ip_whitelist.is_some() || route.ip_blacklist.is_some())
+            && (route.ip_whitelist.is_some()
+                || route.ip_blacklist.is_some()
+                || route.blocked_countries.is_some()
+                || route.whitelist_countries.is_some())
         {
             match guard_core_engine::ip_gate::RouteIpGate::new(
                 route.ip_whitelist.iter().flatten().map(String::as_str),
                 route.ip_blacklist.iter().flatten().map(String::as_str),
             ) {
                 Ok(gate) => {
-                    let verdict = client_ip.map_or(
-                        guard_core_engine::ip_gate::RouteIpVerdict::Unrestricted,
-                        |addr| gate.evaluate(addr),
+                    let countries = guard_core_engine::geo::parse_country_lists(
+                        route
+                            .whitelist_countries
+                            .iter()
+                            .flatten()
+                            .map(String::as_str),
+                        route.blocked_countries.iter().flatten().map(String::as_str),
                     );
-                    if verdict == guard_core_engine::ip_gate::RouteIpVerdict::Denied {
+                    let access =
+                        gate.evaluate_access(client_ip, &countries, self.geo_handler.as_deref());
+                    if access.verdict == guard_core_engine::ip_gate::RouteIpVerdict::Denied {
                         return crate::scan::stage_block(request, 403, crate::FORBIDDEN_MESSAGE);
                     }
                     skip_global_ip_lists = gate.whitelist_configured();
+                    skip_global_countries = access.country_whitelist_matched;
                 }
                 Err(_) => return Verdict::Failed,
-            }
-        }
-
-        // The route's country rules (`blocked_countries` /
-        // `whitelist_countries`, the reference `check_country_access`
-        // inside `_check_route_ip_access`): a route whitelist that passes
-        // also skips the global geo stage for the request
-        // (`skip_countries`). An unresolvable country blocks only under a
-        // restrictive route whitelist, exactly the engine's
-        // `check_countries` reading.
-        let mut skip_global_countries = false;
-        if !bypassed("ip")
-            && let Some(route) = route
-            && (route.blocked_countries.is_some() || route.whitelist_countries.is_some())
-        {
-            let route_gate = guard_core_engine::geo::parse_country_lists(
-                route
-                    .whitelist_countries
-                    .iter()
-                    .flatten()
-                    .map(String::as_str),
-                route.blocked_countries.iter().flatten().map(String::as_str),
-            );
-            if let (Some(addr), Some(handler)) = (client_ip, self.geo_handler.as_ref()) {
-                if let Some(_block) = guard_core_engine::geo::check_countries(
-                    addr,
-                    &route_gate,
-                    handler.as_ref(),
-                    false,
-                ) {
-                    return crate::scan::stage_block(request, 403, crate::FORBIDDEN_MESSAGE);
-                }
-                skip_global_countries = !route_gate.whitelist_countries.is_empty();
             }
         }
 
