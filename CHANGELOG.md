@@ -2,6 +2,30 @@
 
 All notable changes to this project.
 
+Unreleased
+----------
+
+The parity release: the reference `exclude_paths`, client and response-pass semantics, and the whole `SecurityConfig` through the facade's `Wiring`.
+
+### Added
+
+- Client resolution with the reference rules: the connecting peer plus `X-Forwarded-For` through `trusted_proxies` and `trusted_proxy_depth`, IPv4-mapped peers canonicalized. A request with no peer and no resolvable client answers `403 Client address could not be determined` under `fail_secure` (check name `client_address_unresolved` on the `on_block` hook), after the exclusion decision. `GuardFairing::with_client_policy` and `ClientPolicy` install the policy (a bare fairing keeps `fail_secure = false`), and `WebSocketGuardConfig::with_client_policy` gives the upgrade guard the same resolution
+- `GuardExclusionScoped`, the marker an `exclude_paths` request carries (the reference `guard_exclusion_scoped`, read it as an `Option<GuardExclusionScoped>` request guard), and the scoped pipeline it runs: route resolution, bans, the global IP, country and cloud rules, and the rate limit. The response pass runs scoped (metrics, security headers, CORS and the modifier, no return rules)
+- `GuardFairing::from_security_config_with(config, &WiringOptions)` and `from_wiring(Wiring)`, with the telemetry agent injected through the facade's `TelemetryHandler`. `agent_stats()` now reports the wired sink and its degraded state, `telemetry()` exposes the fan-out, `spawn_dynamic_rules()` starts the dynamic-rule poll loop on request, and the cloud-range refresh runs per request at the cloud check position. New builders: `with_telemetry`, `with_dynamic_rules`, `with_cloud_refresh`, `with_auth_verifier`, `with_body_read_timeout`, `with_path_exclusions`. `GuardConfigError` gained the `Cloud`, `Redis` and `Geo` variants
+- The `security_bypass` event for an all-checks-bypass route (`all_checks_bypassed`), whose request forwards with only the response modifier applied (no metrics, headers or return rules) and continues through the pipeline under `passive_mode`
+- Body `return_pattern` rules now read the response body: the response body is buffered when a rule needs it, bounded in time by `body_read_timeout`, re-emitted intact, and a read error or timeout answers the fail-secure `500`
+
+### Changed
+
+- `exclude_paths` uses the engine's reference matcher instead of an exact raw-path comparison: `/static` covers `/static/app.js`, percent-encoding and dot segments are resolved, and `exclude_paths()` reports the normalized entries. An excluded request is no longer exempt from the pipeline: bans, the global IP lists, country and cloud rules and the rate limit apply, and the request is counted in the metrics. Tests that encoded the old exact-match bypass were updated
+- The client identity no longer comes from Rocket's `client_ip()`, which honors the `X-Real-IP` header from any peer: it is the connecting peer, with `X-Forwarded-For` honored only through the trusted proxies
+- `from_security_config` builds through `Wiring`, so the fields it used to drop now land: geo country rules and `geo_ip_handler`, `block_cloud_providers`, `endpoint_rate_limits`, `enable_rate_limit_auto_ban`, `custom_request_check`, `auth_verifier`, `custom_response_modifier`, `on_error`, `cors_expose_headers`, `trusted_proxies`, the telemetry and event bus, dynamic rules, and the redis stores when `guard-core-rs` has its `redis` feature. The response processor now shares the ban manager with the ban stage, so a return-rule `ban` is enforced by the next request. A config with `fail_secure = true` (the default) rejects a request that carries no peer address
+- The custom response modifier runs even when no response processor is installed, and exactly once when the processor already carries it
+- The HTTPS stage matches `trusted_proxies` against the connecting peer instead of passing no client host, and the request scheme is the transport's own, so a forged `X-Forwarded-Proto` from an untrusted peer no longer skips the redirect
+- A route carrier's `auth_required` and `api_key_required` fall back to the config's global `auth_verifier`
+- `GuardBody` skips its body scan for an excluded request and for a route that bypasses `all` or `penetration`; the size cap stays as the memory bound
+- Documentation: the skill file no longer describes the crate as a scaffold, the README engine-dependency and status statements are corrected, and the new config surface, client policy, scoped exclusions and agent injection are documented
+
 v1.5.0 (2026-10-09)
 -------------------
 

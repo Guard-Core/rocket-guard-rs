@@ -149,20 +149,74 @@
 //! ## The unified configuration surface
 //!
 //! [`GuardFairing::from_security_config`] builds the whole wired pipeline
-//! from the engine's [`SecurityConfig`] (the reference 129-field
-//! configuration surface) in one fail-closed call: the detection budgets,
-//! the IP lists onto the gate, the rate-limit and ban groups,
-//! `enforce_https`, `emergency_mode` + its whitelist,
-//! `custom_error_responses`/`on_block`, the detection-exclusion group, the
-//! observability group, the ReDoS-validated `blocked_user_agents`, and the
-//! security-headers/CORS/behavior response pass. The reference
-//! `exclude_paths` carve-out rides along as a first-class builder consumed
-//! first in the pipeline (an excluded path bypasses every request-side
-//! check, gate included). Invalid values fail closed through the typed
-//! [`GuardConfigError`]. The stages that need a host-provided collaborator
-//! (the geo handler, the distributed stores, the event bus, the custom
-//! checks, the time-window and referrer resolvers) stay opt-in through
-//! their own builders.
+//! from the engine's [`SecurityConfig`] (the reference configuration
+//! surface) through the facade's [`Wiring`], the one mapping every Rust
+//! adapter shares (the field-by-field table is in the
+//! [`guard_core_rs::wiring`] module docs). Geo country rules and
+//! `geo_ip_handler`, `block_cloud_providers` (with the per-request range
+//! refresh), `endpoint_rate_limits`, the rate-limit auto-ban,
+//! `custom_request_check`, `auth_verifier` (the fallback of a route's
+//! verifiers), `custom_response_modifier`, `on_error`, `cors_expose_headers`,
+//! the telemetry sink, the event bus and the dynamic rules all land on the
+//! fairing. Invalid values fail closed through the typed
+//! [`GuardConfigError`]. [`GuardFairing::from_security_config_with`] takes
+//! the collaborators a config cannot carry: the telemetry agent (any
+//! [`TelemetryHandler`], for example guard-agent-rs's `GuardAgentTelemetry`
+//! built from the `agent_*` fields) and the Logfire client. Wiring starts
+//! nothing: [`GuardFairing::telemetry`] exposes the fan-out for the host to
+//! `start()` / `stop()`, and [`GuardFairing::spawn_dynamic_rules`] starts the
+//! dynamic-rule poll loop. `route_resolution_strict` is not applied (Rocket
+//! resolves routes after `on_request`) and stays on the config.
+//!
+//! ## Client resolution
+//!
+//! The identity every stage runs under (gate, bans, rate limit, geo, cloud,
+//! events, the response pass) is resolved from the connecting peer with the
+//! reference rules: `X-Forwarded-For` counts only behind a trusted proxy
+//! (`trusted_proxies`, `trusted_proxy_depth`) and an IPv4-mapped IPv6 peer
+//! is canonicalized. Rocket's own `Request::client_ip()` is never used: it
+//! honors the `X-Real-IP` header from any peer. A request with no peer and
+//! no resolvable client answers `403 Client address could not be
+//! determined` under `fail_secure` (check name `client_address_unresolved`
+//! on the `on_block` hook) before any check, and continues unattributed
+//! under `fail_secure = false`. A bare fairing defaults to no proxies and
+//! `fail_secure = false`; [`GuardFairing::with_client_policy`] installs a
+//! [`ClientPolicy`] and `from_security_config` installs the config's
+//! (`fail_secure` defaults to `true`). The HTTPS stage matches
+//! `trusted_proxies` against the connecting peer and takes the transport's
+//! own scheme, so a forged `X-Forwarded-Proto` does not skip the redirect.
+//!
+//! ## Excluded paths and bypassed routes
+//!
+//! `exclude_paths` uses the reference matcher: `/static` covers `/static`
+//! and `/static/app.js` (never `/staticx`) and percent-encoding and dot
+//! segments are resolved before matching. An excluded request is scoped,
+//! not bypassed: it carries [`GuardExclusionScoped`] and runs route
+//! resolution, the ban check, the global IP lists, country and cloud rules
+//! and the rate limit. Emergency mode, HTTPS enforcement, request logging,
+//! headers and auth, validators, the scan (the [`GuardBody`] body scan
+//! included, its size cap stays as the memory bound), the user-agent
+//! filter, custom checks and the return rules are skipped. The response
+//! still gets the metrics, security headers, CORS and the modifier. The CORS
+//! preflight short-circuit runs before the exclusion decision. A route
+//! carrier that bypasses `all` checks emits the `security_bypass` event,
+//! runs no check and gets only the response modifier (under `passive_mode`
+//! it continues through the pipeline). Rocket cannot answer from
+//! `on_request`, so every refusal here rides the same verdict, guard and
+//! catcher path as any other block.
+//!
+//! ## The response pass
+//!
+//! The modifier of the processor (from the config) and the fairing's
+//! ([`GuardFairing::with_custom_response_modifier`]) each run once, and the
+//! fairing's runs even without a processor. Body `return_pattern` rules
+//! read the response body: when a rule needs it
+//! (`behavior_scan_response_body`) the response body is buffered in full
+//! (bounded in time by `body_read_timeout`; a read error or timeout answers
+//! the fail-secure `500`) and re-emitted intact, and the first
+//! `behavior_max_response_body_inspect_bytes` bytes are what the rules read.
+//! Status-only rules never buffer; do not combine body rules with endless
+//! streaming responses.
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family)
@@ -185,7 +239,7 @@ pub mod websocket;
 
 pub use crate::fairing::AgentStats;
 pub use crate::fairing::GuardFairing;
-pub use crate::guards::{BlockGuard, GuardBody, GuardBodyError};
+pub use crate::guards::{BlockGuard, GuardBody, GuardBodyError, GuardExclusionScoped};
 pub use crate::response::{
     ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
     OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, guard_catchers,
@@ -201,6 +255,7 @@ pub use guard_core_engine::detection_exclusions::{
 };
 pub use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
 pub use guard_core_engine::geo::GeoIpHandler;
+pub use guard_core_engine::headers_auth::AuthVerifier;
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, Clock, IpBanConfig, IpBanConfigError, IpBanManager, ResolvedBan,
     ThreatBanEntry, ViolationCounters,
@@ -208,6 +263,7 @@ pub use guard_core_engine::ip_ban::{
 pub use guard_core_engine::ip_gate::{
     IpGateConfig, IpGateDecision, IpGateDenial, IpGateError, IpGateVerdict,
 };
+pub use guard_core_engine::path_matching::PathExclusions;
 pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
@@ -217,11 +273,16 @@ pub use guard_core_engine::security_config::{
     BufferOverflowPolicy, LogFormat, LogLevel, SecurityConfig, SecurityConfigError,
 };
 pub use guard_core_engine::security_headers::SecurityHeadersConfig;
+pub use guard_core_rs::composite::{CompositeAgentHandler, TelemetryHandler};
 pub use guard_core_rs::events::SecurityEventBus;
 pub use guard_core_rs::metrics::MetricsCollector;
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
 pub use guard_core_rs::tower::{
     ObservabilityConfig, RateLimitStage, RateLimitStageConfig, RequestObservation, StageResponse,
+};
+pub use guard_core_rs::wiring::{
+    ClientPolicy, CloudRefresh, Distributed, DynamicRules, DynamicRulesHandle, Wiring, WiringError,
+    WiringOptions,
 };
 
 /// The multi-surface scan entry point stored in the engine.
@@ -302,6 +363,13 @@ pub enum GuardConfigError {
     UserAgent(guard_core_engine::user_agent::UserAgentConfigError),
     /// An invalid auto-ban knob group.
     Ban(IpBanConfigError),
+    /// A `block_cloud_providers` selector the engine does not know.
+    Cloud(guard_core_engine::cloud_provider::CloudConfigError),
+    /// `enable_redis` without a `redis_url`, or the backend refused it.
+    Redis(String),
+    /// Country rules without a resolver, or the `GeoIP` database could not
+    /// be set up.
+    Geo(String),
 }
 
 impl std::fmt::Display for GuardConfigError {
@@ -311,6 +379,9 @@ impl std::fmt::Display for GuardConfigError {
             Self::RateLimit(error) => write!(f, "rate limit: {error}"),
             Self::UserAgent(error) => write!(f, "blocked user agent: {error}"),
             Self::Ban(error) => write!(f, "ip ban: {error}"),
+            Self::Cloud(error) => write!(f, "block_cloud_providers: {error}"),
+            Self::Redis(message) => write!(f, "redis: {message}"),
+            Self::Geo(message) => write!(f, "geo: {message}"),
         }
     }
 }
@@ -322,6 +393,8 @@ impl std::error::Error for GuardConfigError {
             Self::RateLimit(error) => Some(error),
             Self::UserAgent(error) => Some(error),
             Self::Ban(error) => Some(error),
+            Self::Cloud(error) => Some(error),
+            Self::Redis(_) | Self::Geo(_) => None,
         }
     }
 }
@@ -350,15 +423,17 @@ impl From<IpBanConfigError> for GuardConfigError {
     }
 }
 
-/// The engine log level mapped onto the logging facade's enum (the
-/// reference literals are the same strings).
-pub(crate) fn map_log_level(level: LogLevel) -> guard_core_rs::logging::LogLevel {
-    match level {
-        LogLevel::Info => guard_core_rs::logging::LogLevel::Info,
-        LogLevel::Debug => guard_core_rs::logging::LogLevel::Debug,
-        LogLevel::Warning => guard_core_rs::logging::LogLevel::Warning,
-        LogLevel::Error => guard_core_rs::logging::LogLevel::Error,
-        LogLevel::Critical => guard_core_rs::logging::LogLevel::Critical,
+impl From<WiringError> for GuardConfigError {
+    fn from(error: WiringError) -> Self {
+        match error {
+            WiringError::IpGate(error) => Self::IpGate(error),
+            WiringError::RateLimit(error) => Self::RateLimit(error),
+            WiringError::UserAgent(error) => Self::UserAgent(error),
+            WiringError::Ban(error) => Self::Ban(error),
+            WiringError::Cloud(error) => Self::Cloud(error),
+            WiringError::Redis(message) => Self::Redis(message),
+            WiringError::Geo(message) => Self::Geo(message),
+        }
     }
 }
 
@@ -420,30 +495,6 @@ mod tests {
     }
 
     #[test]
-    fn map_log_level_covers_every_reference_level() {
-        assert!(matches!(
-            map_log_level(LogLevel::Info),
-            guard_core_rs::logging::LogLevel::Info
-        ));
-        assert!(matches!(
-            map_log_level(LogLevel::Debug),
-            guard_core_rs::logging::LogLevel::Debug
-        ));
-        assert!(matches!(
-            map_log_level(LogLevel::Warning),
-            guard_core_rs::logging::LogLevel::Warning
-        ));
-        assert!(matches!(
-            map_log_level(LogLevel::Error),
-            guard_core_rs::logging::LogLevel::Error
-        ));
-        assert!(matches!(
-            map_log_level(LogLevel::Critical),
-            guard_core_rs::logging::LogLevel::Critical
-        ));
-    }
-
-    #[test]
     fn from_security_config_exclude_paths_round_trip_through_the_accessor() {
         let config = SecurityConfig {
             exclude_paths: vec![String::from("/docs")],
@@ -458,6 +509,45 @@ mod tests {
         let fairing = GuardFairing::with_defaults()
             .with_exclude_paths(vec![String::from("/docs"), String::from("/static")]);
         assert_eq!(fairing.exclude_paths(), ["/docs", "/static"]);
+    }
+
+    #[test]
+    fn every_wiring_error_maps_onto_its_config_error() {
+        use guard_core_engine::cloud_provider::parse_cloud_selectors;
+        let user_agent = guard_core_engine::user_agent::UserAgentFilter::new(["(a+)+$"])
+            .err()
+            .map(WiringError::UserAgent);
+        let ip_gate = IpGateConfig::new(["not-an-ip"], [] as [&str; 0], [] as [&str; 0])
+            .err()
+            .map(WiringError::IpGate);
+        let rate = RateLimiter::new(RateLimitConfig {
+            rate_limit: 0,
+            ..RateLimitConfig::default()
+        })
+        .err()
+        .map(WiringError::RateLimit);
+        let ban = Some(WiringError::Ban(IpBanConfigError::NonPositive {
+            field: "auto_ban_threshold",
+        }));
+        let cloud = parse_cloud_selectors(["NotACloud"])
+            .err()
+            .map(WiringError::Cloud);
+        let converted: Vec<GuardConfigError> = [user_agent, ip_gate, rate, ban, cloud]
+            .into_iter()
+            .flatten()
+            .chain([
+                WiringError::Redis("r".to_owned()),
+                WiringError::Geo("g".to_owned()),
+            ])
+            .map(GuardConfigError::from)
+            .collect();
+        assert!(matches!(converted[0], GuardConfigError::UserAgent(_)));
+        assert!(matches!(converted[1], GuardConfigError::IpGate(_)));
+        assert!(matches!(converted[2], GuardConfigError::RateLimit(_)));
+        assert!(matches!(converted[3], GuardConfigError::Ban(_)));
+        assert!(matches!(converted[4], GuardConfigError::Cloud(_)));
+        assert!(matches!(converted[5], GuardConfigError::Redis(_)));
+        assert!(matches!(converted[6], GuardConfigError::Geo(_)));
     }
 
     #[test]

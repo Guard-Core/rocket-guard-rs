@@ -327,6 +327,59 @@ pub(crate) fn record_enforced(request: &Request<'_>, verdict: Verdict) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GateDecision(pub(crate) Option<IpGateDecision>);
 
+/// The resolved client identity of this request (trusted-proxy aware),
+/// stashed by the fairing before any check runs; every stage, guard and the
+/// response pass read the same identity.
+pub(crate) struct ResolvedClient(pub(crate) Option<std::net::IpAddr>);
+
+/// Stash the resolved client for the stages, the guards and the response
+/// pass.
+pub(crate) fn stash_client(request: &Request<'_>, ip: Option<std::net::IpAddr>) {
+    request.local_cache(|| ResolvedClient(ip));
+}
+
+/// The resolved client. Without the fairing's resolution (a guard used
+/// alone) it is the connecting peer: Rocket's own `client_ip()` would honor
+/// the unauthenticated `X-Real-IP` header, so it is never consulted.
+pub(crate) fn client_ip(request: &Request<'_>) -> Option<std::net::IpAddr> {
+    request
+        .local_cache(|| ResolvedClient(request.remote().map(|peer| peer.ip())))
+        .0
+}
+
+/// Which response-side pass the request gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// Return rules, security headers, CORS, the modifier.
+    Full,
+    /// An `exclude_paths` request: no return rules, the rest as `Full`.
+    Scoped,
+    /// An all-checks-bypass route: only the modifier.
+    ModifierOnly,
+}
+
+/// Request-local slot for the response pass kind.
+pub(crate) struct PassSlot(pub(crate) std::sync::Mutex<Pass>);
+
+/// Record the response pass kind (the last write wins: an all-checks-bypass
+/// route overrides the scoped marker).
+pub(crate) fn stash_pass(request: &Request<'_>, pass: Pass) {
+    *request
+        .local_cache(|| PassSlot(std::sync::Mutex::new(Pass::Full)))
+        .0
+        .lock()
+        .expect("pass slot") = pass;
+}
+
+/// The request's response pass kind.
+pub(crate) fn pass(request: &Request<'_>) -> Pass {
+    *request
+        .local_cache(|| PassSlot(std::sync::Mutex::new(Pass::Full)))
+        .0
+        .lock()
+        .expect("pass slot")
+}
+
 /// The gate's skip state for this request, if the gate ran and passed.
 pub(crate) fn gate_decision(request: &Request<'_>) -> Option<IpGateDecision> {
     request.local_cache(|| GateDecision(None)).0
@@ -420,7 +473,7 @@ pub(crate) fn stage_decision(
     });
     let tiers = route_rate_limits(request);
     let decision = stage.decide_tiers_observed(
-        request.client_ip(),
+        client_ip(request),
         Some(request.uri().path().as_str()),
         tiers.as_ref(),
         gate_decision(request),
@@ -442,7 +495,7 @@ pub(crate) fn bans_decision(engine: &GuardEngine, request: &Request<'_>) -> Opti
     }
     let stage = engine.stage.as_ref()?;
     let decision =
-        stage.decide_bans_observed(request.client_ip(), Some(&request_observation(request)))?;
+        stage.decide_bans_observed(client_ip(request), Some(&request_observation(request)))?;
     let (verdict, custom) = verdict_from_stage(&decision);
     record_block_body(request, custom);
     Some(verdict)
@@ -487,8 +540,7 @@ pub(crate) fn metadata_threat_verdict(
     );
     record_block_body(request, Some(body));
     if let Some(observability) = &engine.observability {
-        let ip = request
-            .client_ip()
+        let ip = client_ip(request)
             .map(|ip| ip.to_string())
             .unwrap_or_default();
         let observation = request_observation(request);
@@ -529,7 +581,7 @@ pub(crate) fn enforce_body_finding(
     let gate = gate_decision(request);
     let whitelisted = gate.is_some_and(|gate| gate.is_whitelisted);
     let crossed = stage.feed_finding(
-        request.client_ip(),
+        client_ip(request),
         whitelisted,
         Some(&finding),
         Some(&request_observation(request)),

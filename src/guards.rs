@@ -60,6 +60,37 @@ impl<'r> FromRequest<'r> for BlockGuard {
     }
 }
 
+/// The marker a request on an `exclude_paths` entry carries (the reference
+/// `request.state.guard_exclusion_scoped`): the request runs the scoped
+/// pipeline (route resolution, bans, the global IP rules, the rate limit)
+/// and every other check is skipped, the body scan of [`GuardBody`]
+/// included. Read it as an optional request guard:
+///
+/// ```
+/// use rocket::get;
+/// use rocket_guard_rs::GuardExclusionScoped;
+///
+/// #[get("/docs")]
+/// fn docs(scoped: Option<GuardExclusionScoped>) -> &'static str {
+///     if scoped.is_some() { "scoped" } else { "normal" }
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardExclusionScoped;
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for GuardExclusionScoped {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        if crate::scan::pass(request) == crate::scan::Pass::Scoped {
+            Outcome::Success(Self)
+        } else {
+            Outcome::Forward(Status::NotFound)
+        }
+    }
+}
+
 /// The scanned request body, usable as a data guard.
 ///
 /// Buffering, scanning, and handing the body to the handler are fused into
@@ -154,9 +185,17 @@ impl<'r> FromData<'r> for GuardBody {
             Err(_) => return refused(request, Verdict::Failed, Status::InternalServerError),
         };
 
+        // An excluded request (scoped pipeline) and a route that bypasses
+        // `all` or `penetration` skip the body scan; the size cap above
+        // stays as the memory bound.
+        let skip_scan = crate::scan::pass(request) != crate::scan::Pass::Full
+            || crate::scan::carrier_bypasses(
+                crate::scan::route_carrier(request).as_deref(),
+                "penetration",
+            );
         let verdict = catch_unwind(AssertUnwindSafe(|| {
             let metadata = metadata_verdict(request).unwrap_or(Verdict::Clean);
-            if metadata != Verdict::Clean {
+            if metadata != Verdict::Clean || skip_scan {
                 return metadata;
             }
             // The body view, fed through the stage's split detection feed

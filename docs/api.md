@@ -60,9 +60,12 @@ The gate runs in `on_request` before the metadata scan, on the request's
 client IP: a blacklisted IP - or an IP a non-empty `whitelist` matches
 neither directly nor through `exempt_ips` - is refused with `403 Forbidden`
 (the `Forbidden` body), both through the guards and through the `404` rewrite
-for unrouted paths. A request whose client IP is unknown (Rocket's local test
-client, for example) is not attributed: the gate does not run and the scan
-runs unconditionally.
+for unrouted paths. The client IP is the resolved client (the connecting peer,
+or the forwarded client behind a trusted proxy, see
+`GuardFairing::with_client_policy`; Rocket's own `client_ip()` is not used
+because it trusts `X-Real-IP`). A request whose client IP is unknown is not
+attributed: the gate does not run and the scan runs unconditionally (a
+fairing built with `from_security_config` rejects it under `fail_secure`).
 
 **exempt_ips vs whitelist.** `exempt_ips` is noise reduction for
 known-friendly automation (monitoring probes, VPN egress, a partner's
