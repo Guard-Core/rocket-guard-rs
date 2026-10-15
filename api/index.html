@@ -959,9 +959,12 @@ closed on an invalid entry (<code>IpGateError</code> names the list and the entr
 client IP: a blacklisted IP - or an IP a non-empty <code>whitelist</code> matches
 neither directly nor through <code>exempt_ips</code> - is refused with <code>403 Forbidden</code>
 (the <code>Forbidden</code> body), both through the guards and through the <code>404</code> rewrite
-for unrouted paths. A request whose client IP is unknown (Rocket's local test
-client, for example) is not attributed: the gate does not run and the scan
-runs unconditionally.</p>
+for unrouted paths. The client IP is the resolved client (the connecting peer,
+or the forwarded client behind a trusted proxy, see
+<code>GuardFairing::with_client_policy</code>; Rocket's own <code>client_ip()</code> is not used
+because it trusts <code>X-Real-IP</code>). A request whose client IP is unknown is not
+attributed: the gate does not run and the scan runs unconditionally (a
+fairing built with <code>from_security_config</code> rejects it under <code>fail_secure</code>).</p>
 <p><strong>exempt_ips vs whitelist.</strong> <code>exempt_ips</code> is noise reduction for
 known-friendly automation (monitoring probes, VPN egress, a partner's
 server), not immunity: it sets the same skip state a whitelist match sets but
