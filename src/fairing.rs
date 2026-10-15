@@ -346,6 +346,9 @@ impl GuardFairing {
             fairing = fairing.with_on_block(hook);
         }
 
+        // The spread below keeps the literal compiling when the engine adds a
+        // field; clippy calls it needless while the field list is complete.
+        #[allow(clippy::needless_update)]
         if !config.excluded_detection_headers.is_empty()
             || !config.excluded_detection_params.is_empty()
             || !config.excluded_detection_body_fields.is_empty()
@@ -376,6 +379,7 @@ impl GuardFairing {
                             .collect()
                     }),
                 detection_scan_body: Some(config.detection_scan_body),
+                ..DetectionExclusionConfig::default()
             });
         }
 
