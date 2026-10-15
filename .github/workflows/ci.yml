@@ -52,6 +52,14 @@ jobs:
           rustflags: ""
       - name: cargo check
         run: cargo check --all-targets
+
+      # The MSRV toolchain lints differently from stable; lint here too so a
+      # pull request is held to every toolchain the crate supports.
+      - name: Format check (MSRV)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (MSRV)
+        run: cargo clippy --all-targets -- -D warnings
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
@@ -95,6 +103,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: 1.92.0
+          components: rustfmt, clippy
           rustflags: ""
       - name: cargo check
         run: cargo check --all-targets

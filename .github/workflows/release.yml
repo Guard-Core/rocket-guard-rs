@@ -1,134 +1,128 @@
-name: Release Gate
+name: Release
 
+# Publishes rocket-guard-rs to crates.io for a release tag. Nothing is linted or
+# tested here: the tagged commit must already have passed the push workflows
+# listed in REQUIRED_WORKFLOWS (ci.yml runs fmt and clippy on stable and on
+# the MSRV, the tests and coverage). A release can therefore never fail on a
+# check its pull request did not run.
+#
+# Re-drive: run this workflow by hand (Actions > Release > Run workflow) with
+# the tag, for example v1.6.0. It checks out that tag, so a fixed workflow on
+# master can publish an existing tag. A version already on crates.io is
+# skipped. The engine version the crate pins must be on crates.io first.
 on:
-  push:
-    tags:
-      - 'v*'
   release:
     types: [created]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish, for example v1.6.0'
+        required: true
 
 permissions: {}
 
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
 env:
-  CARGO_INCREMENTAL: 0
-  CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  REQUIRED_WORKFLOWS: >-
+    .github/workflows/ci.yml
+    .github/workflows/live-smoke.yml
+    .github/workflows/security.yml
 
 jobs:
-  test:
-    name: Test at tag (${{ matrix.rust }})
+  verify:
+    name: Tagged commit passed CI
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ['stable', '1.92.0']
+      actions: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Checkout tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Moving branch, same tradeoff as ci.yml: the dependency is a sibling
-      # path checkout, so the tag gate rebuilds against a fresh master
-      # checkout (which carries the matching engine release).
-      - name: Checkout guard-core-rs (path dependency)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Guard-Core/guard-core-rs
-          ref: master
-          path: core-checkout
-          persist-credentials: false
-
-      - name: Place guard-core-rs at the path dependency location
-        run: mv core-checkout ../guard-core-rs
-
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-          rustflags: ""
-
-      # The engine's ReDoS validator spawns the pattern-probe child over the
-      # workspace target dir, and cargo test does not build dependency bins -
-      # without this the user-agent patterns fail secure at the tag (the
-      # guard-core-rs 4ab7f95 fix, adapter side; ci.yml already carries it).
-      - name: Build the pattern-probe child
-        run: cargo build -p guard-core-engine --bins
-
-      - name: cargo fmt check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test
-
-  tag-consistency:
-    name: Tag matches crate version
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # cargo metadata resolves the sibling path dependency, so it must be
-      # checked out before the version can be read (same as the test job).
-      - name: Checkout guard-core-rs (path dependency)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Guard-Core/guard-core-rs
-          ref: master
-          path: core-checkout
-          persist-credentials: false
-
-      - name: Place guard-core-rs at the path dependency location
-        run: mv core-checkout ../guard-core-rs
-
-      # Publishing is automated: the publish job below runs on GitHub
-      # release creation. This tag/version consistency gate remains the
-      # cheap check that the tag matches the published crate version.
-      - name: Verify tag equals the crate version
+      - name: Resolve the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rocket-guard-rs") | .version')
-          if [ "$tag" != "$version" ]; then
-            echo "tag v$tag does not match crate version $version"
+          tag="${INPUT_TAG:-$RELEASE_TAG}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$tag' is not of the form v1.2.3"
             exit 1
           fi
-          echo "ok: tag v$tag matches crate version $version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Verify the tag equals the crate version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match rocket-guard-rs version $version"
+            exit 1
+          fi
+          echo "ok: $TAG matches rocket-guard-rs $version"
+
+      # The newest push run of each required workflow on the tagged commit
+      # must have succeeded. A release created right after a merge waits for
+      # them (up to an hour) instead of failing.
+      - name: Require green CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for _ in $(seq 1 60); do
+            runs=$(gh api "repos/$REPO/actions/runs?head_sha=$sha&event=push&per_page=100" \
+              --jq '[.workflow_runs | group_by(.path)[] | max_by(.run_number) | {path, status, conclusion}]')
+            waiting=0
+            for wf in $REQUIRED_WORKFLOWS; do
+              run=$(jq -c --arg p "$wf" '.[] | select(.path == $p)' <<< "$runs")
+              if [ -z "$run" ]; then
+                echo "$wf: no push run on $sha yet"; waiting=1; continue
+              fi
+              status=$(jq -r .status <<< "$run"); conclusion=$(jq -r .conclusion <<< "$run")
+              if [ "$status" != "completed" ]; then
+                echo "$wf: $status"; waiting=1
+              elif [ "$conclusion" != "success" ]; then
+                echo "::error::$wf concluded $conclusion on $sha; fix master and release a new tag"
+                exit 1
+              else
+                echo "ok: $wf success on $sha"
+              fi
+            done
+            [ "$waiting" = "0" ] && exit 0
+            sleep 60
+          done
+          echo "::error::required workflows did not finish on $sha within an hour"
+          exit 1
 
   publish:
     name: Publish to crates.io
-    needs: tag-consistency
-    # Trusted publishing (crates.io enforces it for this crate): the job
-    # exchanges the Actions OIDC token via id-token: write. workflow_dispatch
-    # is allowed so a publish can be re-driven after a partial failure
-    # (master's crate version must match the intended release).
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout release tag
+      - name: Checkout the tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ needs.verify.outputs.tag }}
           persist-credentials: false
 
-      # The root workspace (examples included) resolves the sibling path
-      # dependency before packaging, so it must be checked out here too.
-      # The packaged crate itself ships the registry dependency: packaging
-      # strips the path and keeps the version pin, which already exists on
-      # crates.io.
+      # The workspace resolves the sibling path dependencies before packaging,
+      # so they are checked out here too. The packaged crate ships the
+      # registry dependencies: packaging strips the path and keeps the version.
       - name: Checkout guard-core-rs (path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,26 +145,24 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
-      # Retried up to 3 times (crates.io transient 5xx). A version already
-      # on crates.io (the partial-failure rerun) skips via the registry
-      # check, so a re-drive never blocks on the identical-version rejection.
       - name: Publish rocket-guard-rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
         run: |
-          set -o pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          published=$(curl -fsSL -A "rocket-guard-rs release (https://github.com/Guard-Core/rocket-guard-rs)" "https://crates.io/api/v1/crates/rocket-guard-rs" | jq -r .crate.max_version || true)
-          if [ "$published" = "$tag" ]; then
-            echo "rocket-guard-rs $tag is already on crates.io; skipping"
+          version="${TAG#v}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A "rocket-guard-rs release (https://github.com/Guard-Core/rocket-guard-rs)" \
+            "https://crates.io/api/v1/crates/rocket-guard-rs/$version")
+          if [ "$code" = "200" ]; then
+            echo "rocket-guard-rs $version is already on crates.io; skipping"
             exit 0
           fi
           for attempt in 1 2 3; do
-            if cargo publish; then
+            if cargo publish -p rocket-guard-rs; then
               exit 0
             fi
             echo "attempt $attempt failed; retrying in 30s"
             sleep 30
           done
-          echo "rocket-guard-rs publish failed after 3 attempts"
+          echo "::error::rocket-guard-rs publish failed after 3 attempts"
           exit 1
