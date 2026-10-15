@@ -99,12 +99,14 @@
 //! }
 //! ```
 //!
-//! The client IP resolves through Rocket's `Request::client_ip()` (the
-//! connection peer, or whatever the host resolves it to). `scan_frame`'s
-//! `client_ip` argument takes the same identity - capture it from the
-//! request (a `Result<WebSocketGuard, _>` handler can read
-//! `rocket::Request::client_ip()` through a request guard of its own, or
-//! pass `None` to skip the stateful arms).
+//! The client IP resolves like the HTTP fairing's: the connecting peer, with
+//! `X-Forwarded-For` honored only through the trusted proxies of the
+//! [`ClientPolicy`] installed with
+//! [`WebSocketGuardConfig::with_client_policy`] (Rocket's own
+//! `Request::client_ip()` trusts the `X-Real-IP` header from anyone, so it is
+//! never consulted). `scan_frame`'s `client_ip` argument takes the same
+//! identity - capture it from the handshake, or pass `None` to skip the
+//! stateful arms.
 
 use guard_core_engine::detect::DetectConfig;
 use guard_core_engine::detection_exclusions::{
@@ -115,6 +117,7 @@ use guard_core_engine::geo::{CountryGate, GeoIpHandler, check_countries};
 use guard_core_engine::ip_ban::{IpBanConfig, IpBanManager, ViolationCounters};
 use guard_core_engine::ip_gate::{IpGateConfig, IpGateVerdict};
 use guard_core_engine::rate_limit::RateLimiter;
+use guard_core_rs::wiring::ClientPolicy;
 use rocket::Request;
 use rocket::http::{HeaderMap, Status};
 use rocket::request::{FromRequest, Outcome};
@@ -252,7 +255,7 @@ pub struct WebSocketGuardConfig {
     rate_limiter: Option<RateLimiter>,
     country_rules: Option<(CountryGate, Arc<dyn GeoIpHandler>)>,
     violation_feed: Option<ViolationFeed>,
-    fail_secure: bool,
+    client: ClientPolicy,
     exclusions: ResolvedExclusions,
 }
 
@@ -267,7 +270,7 @@ impl core::fmt::Debug for WebSocketGuardConfig {
             .field("ban_manager", &self.ban_manager)
             .field("rate_limiter", &self.rate_limiter)
             .field("violation_feed", &self.violation_feed)
-            .field("fail_secure", &self.fail_secure)
+            .field("client", &self.client)
             .field("exclusions", &self.exclusions)
             .finish_non_exhaustive()
     }
@@ -285,7 +288,11 @@ impl WebSocketGuardConfig {
             rate_limiter: None,
             country_rules: None,
             violation_feed: None,
-            fail_secure: false,
+            client: ClientPolicy {
+                trusted_proxies: Vec::new(),
+                trusted_proxy_depth: 1,
+                fail_secure: false,
+            },
             exclusions: resolve_exclusions(None, None),
         }
     }
@@ -337,7 +344,17 @@ impl WebSocketGuardConfig {
     /// determined (the reference `fail_secure` arm).
     #[must_use]
     pub const fn with_fail_secure(mut self, fail_secure: bool) -> Self {
-        self.fail_secure = fail_secure;
+        self.client.fail_secure = fail_secure;
+        self
+    }
+
+    /// Install the client resolution policy (trusted proxies, proxy depth,
+    /// `fail_secure`), the same policy the HTTP fairing resolves the
+    /// upgrade request's client with: behind a trusted proxy the forwarded
+    /// client, not the proxy, is banned, gated and rate limited.
+    #[must_use]
+    pub fn with_client_policy(mut self, client: ClientPolicy) -> Self {
+        self.client = client;
         self
     }
 
@@ -374,7 +391,7 @@ pub fn run_websocket_checks(
     query_params: &[(String, String)],
     headers: &[(String, String)],
 ) -> Result<(), WebSocketCloseReason> {
-    if client_ip.is_none() && config.fail_secure {
+    if client_ip.is_none() && config.client.fail_secure {
         return Err(WS_CLOSE_CLIENT_ADDRESS_UNKNOWN);
     }
 
@@ -591,7 +608,16 @@ impl WebSocketGuard {
     /// [`GeoIpHandler`], a foreign handle) maps to
     /// [`WS_CLOSE_SECURITY_CHECK_FAILED`].
     pub fn upgrade_verdict(&self, request: &Request<'_>) -> Result<(), WebSocketCloseReason> {
-        let client_ip = request.client_ip();
+        let forwarded: Vec<&str> = request.headers().get("x-forwarded-for").collect();
+        let forwarded = (!forwarded.is_empty()).then(|| forwarded.join(", "));
+        let client_ip = self
+            .config
+            .client
+            .resolve(
+                request.remote().map(|remote| remote.ip()),
+                forwarded.as_deref(),
+            )
+            .ip;
         let url_path = request.uri().path().as_str().to_owned();
         let query_params =
             parse_query_pairs(request.uri().query().map_or("", |query| query.as_str()));

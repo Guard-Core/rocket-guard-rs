@@ -17,6 +17,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+// Rocket's own Shield fairing adds `X-Content-Type-Options`, so the guard's
+// security headers are asserted through `Referrer-Policy`, which only the
+// guard's response pass renders.
 const ATTACK_QUERY: &str = "q=%3Cscript%3Ealert(1)%3C/script%3E";
 
 struct Out {
@@ -263,8 +266,8 @@ async fn an_excluded_response_still_gets_the_security_headers() {
     let excluded = out(get_from(&client, "203.0.113.9", "/docs").dispatch().await).await;
     assert_eq!(excluded.status, Status::Ok);
     assert_eq!(
-        header(&excluded, "x-content-type-options").as_deref(),
-        Some("nosniff")
+        header(&excluded, "referrer-policy").as_deref(),
+        Some("strict-origin-when-cross-origin")
     );
 }
 
@@ -326,8 +329,8 @@ async fn a_missing_client_address_is_rejected_under_fail_secure() {
     assert_eq!(rejected.status, Status::Forbidden);
     assert_eq!(rejected.body, "Client address could not be determined");
     assert_eq!(
-        header(&rejected, "x-content-type-options").as_deref(),
-        Some("nosniff"),
+        header(&rejected, "referrer-policy").as_deref(),
+        Some("strict-origin-when-cross-origin"),
         "the rejection rides the response pass"
     );
 }
@@ -809,7 +812,7 @@ async fn an_all_bypass_route_skips_the_pipeline_emits_the_event_and_runs_only_th
     assert_eq!(bypassed.status, Status::Ok, "the attack is not scanned");
     assert_eq!(header(&bypassed, "x-modified").as_deref(), Some("yes"));
     assert_eq!(
-        header(&bypassed, "x-content-type-options"),
+        header(&bypassed, "referrer-policy"),
         None,
         "no security headers on a fully bypassed route"
     );
@@ -850,8 +853,8 @@ async fn an_all_bypass_route_continues_through_the_pipeline_in_passive_mode() {
     let passive = out(get_from(&client, "203.0.113.9", "/open").dispatch().await).await;
     assert_eq!(passive.status, Status::Ok);
     assert_eq!(
-        header(&passive, "x-content-type-options").as_deref(),
-        Some("nosniff"),
+        header(&passive, "referrer-policy").as_deref(),
+        Some("strict-origin-when-cross-origin"),
         "passive mode keeps the response pass"
     );
     assert!(
@@ -874,4 +877,43 @@ async fn an_all_bypass_route_without_an_event_bus_still_forwards() {
     )
     .await;
     assert_eq!(bypassed.status, Status::Ok);
+}
+
+#[tokio::test]
+async fn a_bare_fairing_without_a_read_timeout_buffers_the_body_for_the_rules() {
+    let processor = guard_core_rs::process_response::ResponseProcessor::new(
+        None,
+        None,
+        vec![return_rule("secret", 0)],
+        Arc::new(Mutex::new(
+            guard_core_engine::behavior::BehaviorTracker::new(),
+        )),
+        IpBanManager::new(),
+        true,
+        guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+        false,
+    );
+    let fairing = GuardFairing::with_defaults().with_response_processor(processor);
+    let client = serve_secret(fairing).await;
+    let answered = out(get_from(&client, "203.0.113.9", "/api").dispatch().await).await;
+    assert_eq!(answered.status, Status::Ok);
+    assert_eq!(answered.body, "the secret token is 42");
+}
+
+#[tokio::test]
+async fn every_clone_of_the_fairing_shares_one_set_of_stores() {
+    let config = SecurityConfig {
+        rate_limit: 1,
+        ..SecurityConfig::default()
+    };
+    let fairing = from_config(&config);
+    let first_app = serve(fairing.clone()).await;
+    let second_app = serve(fairing).await;
+    let first = out(get_from(&first_app, "203.0.113.9", "/api").dispatch().await).await;
+    assert_eq!(first.status, Status::Ok);
+    let second = out(get_from(&second_app, "203.0.113.9", "/api")
+        .dispatch()
+        .await)
+    .await;
+    assert_eq!(second.status, Status::TooManyRequests);
 }
