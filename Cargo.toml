@@ -3,7 +3,7 @@ members = ["examples/simple_app", "examples/advanced_app"]
 
 [package]
 name = "rocket-guard-rs"
-version = "1.5.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Application-layer security Fairing for Rocket, powered by the guard-core-rs engine. Part of the guard ecosystem."
@@ -21,13 +21,13 @@ name = "rocket_guard_rs"
 # engine crate inside a sibling guard-core-rs checkout so local builds and CI
 # (see .github/workflows/ci.yml) exercise the engine from source. The version
 # pin stays in lockstep with the published engine release.
-guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", version = "4.3.2" }
+guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", version = "4.4.0" }
 # The engine facade (the event bus, observability knobs, the on_block hook,
 # custom error responses, and the rate-limit stage the fairing delegates to).
 # Path points at the sibling guard-core-rs checkout so local builds and CI
 # exercise it from source; the version pin stays in lockstep with the
 # published facade release.
-guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.2" }
+guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.4.0" }
 rocket = { version = "0.5.1", default-features = false }
 rocket_ws = { version = "0.1.1", features = ["tokio-tungstenite"] }
 serde_json = "1"
@@ -38,7 +38,7 @@ chrono = "0.4"
 # depends on the guard-core-rs facade (its `guard-core` feature), never the
 # reverse, so the facade cannot own this and each adapter does. The runtime
 # handle the agent's async tasks run on comes from the caller's tokio runtime.
-guard-agent-rs = { version = "3.2.3", optional = true, default-features = false, features = ["guard-core"] }
+guard-agent-rs = { version = "3.2.4", optional = true, default-features = false, features = ["guard-core"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 
 [features]

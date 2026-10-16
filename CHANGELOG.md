@@ -2,8 +2,18 @@
 
 All notable changes to this project.
 
-Unreleased
-----------
+v2.0.0 (2026-10-16)
+-------------------
+
+The reference-parity release, training with the 4.4.0 engine: route country rules and the unknown client identity, live dynamic rules, validated config, strict routes, the body read timeout and the agent from config (v2.0.0)
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+### Breaking
+
+- `GuardConfigError` gains the `Config` variant (the engine now runs `SecurityConfig::validate` before wiring) and the `Agent` variant (an agent built from the `agent_*` fields that fails under `agent_strict`), so an exhaustive `match` over it needs arms for both.
+- Trains with the engine: the `guard-core-engine` and `guard-core-rs` floors move to 4.4.0, and the optional `guard-agent-rs` to 3.2.4. `SecurityConfig` gains public fields, so a struct literal needs `..Default::default()`; an invalid IP list entry is now reported as `Config` instead of `IpGate`.
+- Behavior to know before upgrading: a route whitelist match no longer overrides a blocked country, the unknown client identity is denied on a route with an `ip_whitelist` or `whitelist_countries`, route usage rules run after the security pipeline, each dynamic rule version applies over the base config instead of stacking, a request body that does not arrive within `body_read_timeout` is answered 408, and `route_resolution_strict` answers an unresolved route with 500.
+
 
 The parity release: the reference `exclude_paths`, client and response-pass semantics, and the whole `SecurityConfig` through the facade's `Wiring`.
 

@@ -777,9 +777,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "guard-agent-rs"
-version = "3.2.3"
+version = "3.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b2d4523c9957066fa1dd92331a95cd8fe9378c797f9ecaf05360c875866586"
+checksum = "c1db239a662a587ce8a0b72f88ad131b0974ce2e9df85f494956e351d23d97b6"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-engine"
-version = "4.3.3"
+version = "4.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.3.3"
+version = "4.4.0"
 dependencies = [
  "chrono",
  "guard-core-engine",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "rocket-guard-rs"
-version = "1.5.0"
+version = "2.0.0"
 dependencies = [
  "chrono",
  "guard-agent-rs",
