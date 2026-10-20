@@ -4,6 +4,7 @@ members = ["examples/simple_app", "examples/advanced_app"]
 [package]
 name = "rocket-guard-rs"
 version = "2.0.0"
+authors = ["Renzo Franceschini <rennf93@guard-core.com>"]
 edition = "2024"
 rust-version = "1.92"
 description = "Application-layer security Fairing for Rocket, powered by the guard-core-rs engine. Part of the guard ecosystem."
