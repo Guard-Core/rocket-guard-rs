@@ -181,3 +181,20 @@ jobs:
       # aggregation artifact documented above.
       - name: Print the informational llvm-cov summary
         run: cargo llvm-cov report
+
+  ci:
+    # The context master-rule requires: it reports on every run and fails when a job above failed or was
+    # cancelled. A skipped job counts as passed.
+    if: always()
+    needs: [check, msrv, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job above succeeded or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in failure|cancelled) exit 1 ;; esac
+          done
