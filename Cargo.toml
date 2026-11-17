@@ -39,7 +39,7 @@ jiff = { version = "1.0", default-features = false, features = ["std"] }
 # depends on the guard-core-rs facade (its `guard-core` feature), never the
 # reverse, so the facade cannot own this and each adapter does. The runtime
 # handle the agent's async tasks run on comes from the caller's tokio runtime.
-guard-agent-rs = { version = "3.2.4", optional = true, default-features = false, features = ["guard-core"] }
+guard-agent-rs = { version = "3.2.4", path = "../guard-agent-rs", optional = true, default-features = false, features = ["guard-core"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 
 [features]

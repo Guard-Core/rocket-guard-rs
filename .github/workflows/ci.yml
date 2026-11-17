@@ -42,8 +42,21 @@ jobs:
           path: core-checkout
           persist-credentials: false
 
+      # TEMPORARY companion pin: guard-agent-rs moves from chrono to jiff on
+      # fix/chrono-to-jiff together with the engine. Reset this ref to master
+      # after the train merges.
+      - name: Checkout guard-agent-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Guard-Core/guard-agent-rs
+          ref: fix/chrono-to-jiff
+          path: agent-checkout
+          persist-credentials: false
+
       - name: Place guard-core-rs at the path dependency location
-        run: mv core-checkout ../guard-core-rs
+        run: |
+          mv core-checkout ../guard-core-rs
+          mv agent-checkout ../guard-agent-rs
 
       - name: Install the stable Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
@@ -96,8 +109,21 @@ jobs:
           path: core-checkout
           persist-credentials: false
 
+      # TEMPORARY companion pin: guard-agent-rs moves from chrono to jiff on
+      # fix/chrono-to-jiff together with the engine. Reset this ref to master
+      # after the train merges.
+      - name: Checkout guard-agent-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Guard-Core/guard-agent-rs
+          ref: fix/chrono-to-jiff
+          path: agent-checkout
+          persist-credentials: false
+
       - name: Place guard-core-rs at the path dependency location
-        run: mv core-checkout ../guard-core-rs
+        run: |
+          mv core-checkout ../guard-core-rs
+          mv agent-checkout ../guard-agent-rs
 
       - name: Install the MSRV Rust toolchain (1.92)
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
@@ -133,8 +159,21 @@ jobs:
           path: core-checkout
           persist-credentials: false
 
+      # TEMPORARY companion pin: guard-agent-rs moves from chrono to jiff on
+      # fix/chrono-to-jiff together with the engine. Reset this ref to master
+      # after the train merges.
+      - name: Checkout guard-agent-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Guard-Core/guard-agent-rs
+          ref: fix/chrono-to-jiff
+          path: agent-checkout
+          persist-credentials: false
+
       - name: Place guard-core-rs at the path dependency location
-        run: mv core-checkout ../guard-core-rs
+        run: |
+          mv core-checkout ../guard-core-rs
+          mv agent-checkout ../guard-agent-rs
 
       - name: Install the stable Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
