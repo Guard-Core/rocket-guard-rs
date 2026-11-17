@@ -32,7 +32,7 @@ guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.4
 rocket = { version = "0.5.1", default-features = false }
 rocket_ws = { version = "0.1.1", features = ["tokio-tungstenite"] }
 serde_json = "1"
-chrono = "0.4"
+jiff = { version = "1.0", default-features = false, features = ["std"] }
 
 # The telemetry agent built from the `agent_*` config fields (the reference
 # `guard_agent(config.to_agent_config())`): feature `agent`. guard-agent-rs
