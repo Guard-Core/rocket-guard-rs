@@ -37,12 +37,15 @@ jobs:
       # The example builds the adapter from the repo and the engine from its
       # sibling path dependency (../guard-core-rs), so check out the engine
       # next to the workspace; the compose additional_context points at it.
+      # TEMPORARY companion pin: the engine moves from chrono to jiff on
+      # fix/rustsec-actix-2026-11 (guard-core-rs PR 184). Reset this ref to
+      # master after the train merges.
       - name: Checkout guard-core-rs (sibling path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-core-rs
           # Merged as rennf93/guard-core-rs#22; tracks master.
-          ref: master
+          ref: fix/rustsec-actix-2026-11
           path: core-checkout
           persist-credentials: false
 

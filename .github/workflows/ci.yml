@@ -34,11 +34,14 @@ jobs:
       # (../guard-core-rs/crates/guard-core-engine) with a documented TODO to
       # switch to the versioned crate once guard-core-rs is tagged. Once the
       # engine publishes, this checkout step drops in favor of the registry.
+      # TEMPORARY companion pin: the engine moves from chrono to jiff on
+      # fix/rustsec-actix-2026-11 (guard-core-rs PR 184). Reset this ref to
+      # master after the train merges.
       - name: Checkout guard-core-rs (path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-core-rs
-          ref: master
+          ref: fix/rustsec-actix-2026-11
           path: core-checkout
           persist-credentials: false
 
@@ -101,11 +104,14 @@ jobs:
       # branch is history: guard-core-rs merged it, so this checkout tracks
       # master again (and drops for the registry crate once it is tagged).
       # Moving branch, same tradeoff as the stable job above.
+      # TEMPORARY companion pin: the engine moves from chrono to jiff on
+      # fix/rustsec-actix-2026-11 (guard-core-rs PR 184). Reset this ref to
+      # master after the train merges.
       - name: Checkout guard-core-rs (path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-core-rs
-          ref: master
+          ref: fix/rustsec-actix-2026-11
           path: core-checkout
           persist-credentials: false
 
@@ -151,11 +157,14 @@ jobs:
 
       # Moving branch, same tradeoff as the stable job above: the engine is
       # a local path dependency until it is tagged.
+      # TEMPORARY companion pin: the engine moves from chrono to jiff on
+      # fix/rustsec-actix-2026-11 (guard-core-rs PR 184). Reset this ref to
+      # master after the train merges.
       - name: Checkout guard-core-rs (path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-core-rs
-          ref: master
+          ref: fix/rustsec-actix-2026-11
           path: core-checkout
           persist-credentials: false
 
