@@ -6,6 +6,10 @@
 # context named "engine" (compose additional_contexts / docker
 # --build-context engine=<path to guard-core-rs checkout>); only the engine
 # crate and its workspace manifest are copied out of that context.
+#
+# guard-agent-rs is the optional telemetry path dependency; cargo resolves it
+# even when the feature is off, so it comes the same way, as the additional
+# build context named "agent" (its manifest, lockfile and source).
 FROM rust:1.95-slim-bookworm AS build
 
 WORKDIR /build
@@ -14,6 +18,10 @@ COPY --from=engine /Cargo.toml ./guard-core-rs/Cargo.toml
 COPY --from=engine /Cargo.lock ./guard-core-rs/Cargo.lock
 COPY --from=engine /crates/guard-core-engine ./guard-core-rs/crates/guard-core-engine
 COPY --from=engine /crates/guard-core-rs ./guard-core-rs/crates/guard-core-rs
+
+COPY --from=agent /Cargo.toml ./guard-agent-rs/Cargo.toml
+COPY --from=agent /Cargo.lock ./guard-agent-rs/Cargo.lock
+COPY --from=agent /src ./guard-agent-rs/src
 
 COPY Cargo.toml Cargo.lock ./rocket-guard-rs/
 COPY src ./rocket-guard-rs/src

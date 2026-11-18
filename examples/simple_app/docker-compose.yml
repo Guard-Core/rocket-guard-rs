@@ -9,8 +9,10 @@ services:
       context: ../..
       dockerfile: examples/simple_app/Dockerfile
       additional_contexts:
-        # Sibling engine checkout; CI places one at ../guard-core-rs.
+        # Sibling checkouts; CI places the engine at ../guard-core-rs and the
+        # telemetry agent at ../guard-agent-rs.
         engine: ../../../guard-core-rs
+        agent: ../../../guard-agent-rs
     image: rocket-guard-rs-simple-app:local
     ports:
       - "${SMOKE_PORT:-8080}:8080"
