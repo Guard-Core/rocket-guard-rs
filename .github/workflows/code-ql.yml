@@ -39,8 +39,18 @@ jobs:
           path: core-checkout
           persist-credentials: false
 
+      - name: Checkout guard-agent-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Guard-Core/guard-agent-rs
+          ref: master
+          path: agent-checkout
+          persist-credentials: false
+
       - name: Place guard-core-rs at the path dependency location
-        run: mv core-checkout ../guard-core-rs
+        run: |
+          mv core-checkout ../guard-core-rs
+          mv agent-checkout ../guard-agent-rs
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3

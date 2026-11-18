@@ -740,12 +740,12 @@ async fn time_window_gate_blocks_outside_the_window() {
     // The window is computed from the live clock so the test is
     // deterministic: the gate closes for everything except a two-minute
     // band that starts two minutes from now.
-    let now = chrono::Utc::now();
-    let start = (now + chrono::Duration::minutes(2))
-        .format("%H:%M")
+    let now = jiff::Timestamp::now();
+    let start = (now + jiff::SignedDuration::from_mins(2))
+        .strftime("%H:%M")
         .to_string();
-    let end = (now + chrono::Duration::minutes(3))
-        .format("%H:%M")
+    let end = (now + jiff::SignedDuration::from_mins(3))
+        .strftime("%H:%M")
         .to_string();
     let stage = TimeWindowStage::builder(GateConfig::default())
         .resolver(Arc::new(move |path: &str| {

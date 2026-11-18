@@ -912,6 +912,17 @@ mod tests {
     };
     use guard_core_rs::tower::StageResponse;
 
+    #[tokio::test]
+    async fn the_peer_is_the_client_and_no_redirect_is_recorded_on_a_fresh_request() {
+        let client = rocket::local::asynchronous::Client::tracked(rocket::build())
+            .await
+            .expect("valid rocket");
+        let peer: std::net::SocketAddr = "203.0.113.9:4000".parse().expect("peer");
+        let request = client.get("/").remote(peer);
+        assert_eq!(client_ip(request.inner()), Some(peer.ip()));
+        assert_eq!(redirect_target(request.inner()), None);
+    }
+
     #[test]
     fn verdict_status_mapping_covers_every_shape() {
         assert_eq!(Verdict::Clean.status(), Status::Ok);

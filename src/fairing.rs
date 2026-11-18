@@ -2299,7 +2299,7 @@ impl GuardFairing {
                 timezone: restrictions.get("timezone").cloned(),
             };
             let current = guard_core_engine::time_window::hhmm_in_zone(
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
                 window.timezone.as_deref(),
             );
             if !guard_core_engine::time_window::is_within(&window, &current) {
@@ -2566,6 +2566,23 @@ mod tests {
         // The reference `reset()`: the same identity starts afresh.
         fairing.reset();
         assert!(probe.check(client, None).allowed);
+    }
+
+    #[test]
+    fn reset_without_a_rate_limiter_changes_nothing() {
+        let fairing = GuardFairing::with_defaults();
+        fairing.reset();
+        assert!(fairing.engine.rate_limiter.is_none());
+    }
+
+    #[test]
+    fn a_config_without_ip_banning_installs_no_ban_state() {
+        let config = guard_core_engine::security_config::SecurityConfig {
+            enable_ip_banning: false,
+            ..guard_core_engine::security_config::SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid config");
+        assert!(fairing.engine.ban_state.is_none());
     }
 
     #[test]
@@ -3429,9 +3446,8 @@ mod tests {
 
     #[tokio::test]
     async fn route_time_restrictions_gate_their_route() {
-        use chrono::Timelike;
-        let now = chrono::Utc::now();
-        let now_minutes = i64::from(now.hour() * 60 + now.minute());
+        let now = jiff::Timestamp::now().to_zoned_datetime(jiff::tz::TimeZone::UTC);
+        let now_minutes = i64::from(now.hour()) * 60 + i64::from(now.minute());
         let (late_start, late_end) = (now_minutes + 5, now_minutes + 10);
         let (early_start, early_end) = (now_minutes - 15, now_minutes - 10);
         let blocked = crate::RouteConfig {
@@ -5334,6 +5350,72 @@ mod stateful_tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, "custom_response_modifier");
     }
+    #[tokio::test]
+    async fn a_panicking_response_modifier_without_an_error_hook_still_restores() {
+        let fairing = GuardFairing::with_defaults()
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|_bits: &mut ResponseBits| {
+                panic!("modifier exploded");
+            }));
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .get("/hello")
+            .remote(peer("203.0.113.9"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert!(
+            response
+                .headers()
+                .get_one("X-Content-Type-Options")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowed_gate_decision_without_a_client_ip_lets_the_request_through() {
+        let gate = IpGateConfig::new([] as [&str; 0], ["198.51.100.1"], [] as [&str; 0])
+            .expect("valid lists");
+        let fairing = GuardFairing::with_defaults().with_ip_gate(gate);
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client.get("/hello").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn request_logging_composes_the_line_for_a_request_without_a_query() {
+        let config = SecurityConfig {
+            log_request_level: Some(guard_core_engine::security_config::LogLevel::Info),
+            ..SecurityConfig::default()
+        };
+        let fairing = GuardFairing::from_security_config(&config).expect("valid");
+        let client = Client::tracked(
+            rocket::build()
+                .attach(fairing)
+                .mount("/", routes![hello_stateful]),
+        )
+        .await
+        .expect("valid rocket");
+        let response = client
+            .get("/hello")
+            .remote(peer("203.0.113.9"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
     #[tokio::test]
     async fn the_log_level_knobs_feed_the_stage_surfaces() {
         // `log_request_level` installs the request-logging stage; the

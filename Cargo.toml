@@ -32,14 +32,14 @@ guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.4
 rocket = { version = "0.5.1", default-features = false }
 rocket_ws = { version = "0.1.1", features = ["tokio-tungstenite"] }
 serde_json = "1"
-chrono = "0.4"
+jiff = { version = "1.0", default-features = false, features = ["std"] }
 
 # The telemetry agent built from the `agent_*` config fields (the reference
 # `guard_agent(config.to_agent_config())`): feature `agent`. guard-agent-rs
 # depends on the guard-core-rs facade (its `guard-core` feature), never the
 # reverse, so the facade cannot own this and each adapter does. The runtime
 # handle the agent's async tasks run on comes from the caller's tokio runtime.
-guard-agent-rs = { version = "3.2.4", optional = true, default-features = false, features = ["guard-core"] }
+guard-agent-rs = { version = "3.2.4", path = "../guard-agent-rs", optional = true, default-features = false, features = ["guard-core"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 
 [features]
