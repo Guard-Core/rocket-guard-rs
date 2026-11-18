@@ -123,25 +123,19 @@ jobs:
       # The workspace resolves the sibling path dependencies before packaging,
       # so they are checked out here too. The packaged crate ships the
       # registry dependencies: packaging strips the path and keeps the version.
-      # TEMPORARY companion pin: the engine moves from chrono to jiff on
-      # fix/rustsec-actix-2026-11 (guard-core-rs PR 184). Reset this ref to
-      # master after the train merges.
       - name: Checkout guard-core-rs (path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-core-rs
-          ref: fix/rustsec-actix-2026-11
+          ref: master
           path: core-checkout
           persist-credentials: false
 
-      # TEMPORARY companion pin: guard-agent-rs moves from chrono to jiff on
-      # fix/chrono-to-jiff together with the engine. Reset this ref to master
-      # after the train merges.
       - name: Checkout guard-agent-rs (path dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-agent-rs
-          ref: fix/chrono-to-jiff
+          ref: master
           path: agent-checkout
           persist-credentials: false
 
