@@ -10,12 +10,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # h2 0.3.x is the last branch actix-http 3.x accepts, and 0.3.27 (the
-  # latest) is the flagged one; the fix lives in h2 0.4, which actix-http
-  # does not consume yet. Drop this entry when actix-http migrates to h2 0.4.
-  "RUSTSEC-2026-0258",
-]
+# An ignore entry whose crate has left Cargo.lock is an error, so it cannot outlive the lock it was written for.
+unused-ignored-advisory = "deny"
+ignore = []
 
 [licenses]
 version = 2
